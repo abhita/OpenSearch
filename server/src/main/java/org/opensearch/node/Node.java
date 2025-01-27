@@ -1003,7 +1003,7 @@ public class Node implements Closeable {
             final ViewService viewService = new ViewService(clusterService, client, null);
             CryptoSettings.initializeKMSKeys(
                 EncryptionProvider.KMS_KEY_ID,
-                "88675dd8-1c59-423d-8653-bea7a0d4f2b9"
+                "<Your-KMS-Key-ID>"
             );
             Collection<Object> pluginComponents = pluginsService.filterPlugins(Plugin.class)
                 .stream()
