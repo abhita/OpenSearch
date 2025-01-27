@@ -69,6 +69,13 @@ dependencies {
   api "software.amazon.awssdk:aws-query-protocol:${versions.aws}"
   api "software.amazon.awssdk:sts:${versions.aws}"
   api "software.amazon.awssdk:netty-nio-client:${versions.aws}"
+  api "software.amazon.encryption.s3:amazon-s3-encryption-client-java:3.2.3"
+  api "software.amazon.awssdk:kms:${versions.aws}"
+  //api "software.amazon.awssdk:aws-crt-client:2.20.18"
+
+  api "com.sun.xml.messaging.saaj:saaj-impl:3.0.2"
+  api "jakarta.xml.soap:jakarta.xml.soap-api:3.0.1"
+  api "org.jvnet.staxex:stax-ex:2.1.0"
 
   api "org.apache.httpcomponents:httpclient:${versions.httpclient}"
   api "org.apache.httpcomponents:httpcore:${versions.httpcore}"

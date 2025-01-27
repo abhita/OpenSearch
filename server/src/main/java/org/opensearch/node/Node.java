@@ -91,6 +91,8 @@ import org.opensearch.common.SetOnce;
 import org.opensearch.common.StopWatch;
 import org.opensearch.common.cache.module.CacheModule;
 import org.opensearch.common.cache.service.CacheService;
+import org.opensearch.common.crypto.CryptoSettings;
+import org.opensearch.common.crypto.EncryptionProvider;
 import org.opensearch.common.inject.Injector;
 import org.opensearch.common.inject.Key;
 import org.opensearch.common.inject.Module;
@@ -999,7 +1001,10 @@ public class Node implements Closeable {
             );
 
             final ViewService viewService = new ViewService(clusterService, client, null);
-
+            CryptoSettings.initializeKMSKeys(
+                EncryptionProvider.KMS_KEY_ID,
+                "88675dd8-1c59-423d-8653-bea7a0d4f2b9"
+            );
             Collection<Object> pluginComponents = pluginsService.filterPlugins(Plugin.class)
                 .stream()
                 .flatMap(

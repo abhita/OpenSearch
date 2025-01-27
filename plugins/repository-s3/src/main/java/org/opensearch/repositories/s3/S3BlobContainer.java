@@ -37,25 +37,7 @@ import software.amazon.awssdk.core.async.AsyncResponseTransformer;
 import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
-import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
-import software.amazon.awssdk.services.s3.model.CommonPrefix;
-import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
-import software.amazon.awssdk.services.s3.model.CompletedMultipartUpload;
-import software.amazon.awssdk.services.s3.model.CompletedPart;
-import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
-import software.amazon.awssdk.services.s3.model.GetObjectAttributesRequest;
-import software.amazon.awssdk.services.s3.model.GetObjectAttributesResponse;
-import software.amazon.awssdk.services.s3.model.GetObjectRequest;
-import software.amazon.awssdk.services.s3.model.GetObjectResponse;
-import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
-import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
-import software.amazon.awssdk.services.s3.model.ObjectAttributes;
-import software.amazon.awssdk.services.s3.model.PutObjectRequest;
-import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
-import software.amazon.awssdk.services.s3.model.UploadPartRequest;
-import software.amazon.awssdk.services.s3.model.UploadPartResponse;
+import software.amazon.awssdk.services.s3.model.*;
 import software.amazon.awssdk.services.s3.paginators.ListObjectsV2Iterable;
 import software.amazon.awssdk.services.s3.paginators.ListObjectsV2Publisher;
 import software.amazon.awssdk.utils.CollectionUtils;
@@ -106,6 +88,7 @@ import java.util.stream.Collectors;
 
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
+import software.amazon.encryption.s3.S3AsyncEncryptionClient;
 
 import static org.opensearch.repositories.s3.S3Repository.MAX_FILE_SIZE;
 import static org.opensearch.repositories.s3.S3Repository.MAX_FILE_SIZE_USING_MULTIPART;
@@ -256,7 +239,7 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
             StreamContext streamContext = SocketAccess.doPrivileged(() -> writeContext.getStreamProvider(partSize));
             try (AmazonAsyncS3Reference amazonS3Reference = SocketAccess.doPrivileged(blobStore::asyncClientReference)) {
 
-                S3AsyncClient s3AsyncClient;
+                S3AsyncEncryptionClient s3AsyncClient;
                 if (writeContext.getWritePriority() == WritePriority.URGENT) {
                     s3AsyncClient = amazonS3Reference.get().urgentClient();
                 } else if (writeContext.getWritePriority() == WritePriority.HIGH) {
@@ -296,7 +279,7 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
     }
 
     private CompletableFuture<Void> createFileCompletableFuture(
-        S3AsyncClient s3AsyncClient,
+        S3AsyncEncryptionClient s3AsyncClient,
         UploadRequest uploadRequest,
         StreamContext streamContext,
         ActionListener<Void> completionListener
@@ -359,8 +342,10 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
         }
     }
 
+    /*disabling check since with the client-side encryption enabled,
+    the encrypted content at Server will mismatch with the data before upload */
     public boolean remoteIntegrityCheckSupported() {
-        return true;
+        return false;
     }
 
     // package private for testing
@@ -621,12 +606,16 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
 
             long bytesCount = 0;
             for (int i = 1; i <= nbParts; i++) {
-                final UploadPartRequest uploadPartRequest = UploadPartRequest.builder()
-                    .bucket(bucketName)
+                final UploadPartRequest.Builder uploadPartRequestbuilder = UploadPartRequest.builder();
+                final UploadPartRequest uploadPartRequest;
+
+                //for S3-encrypted client, we need to specify SDK-part type for the last part
+                uploadPartRequest = uploadPartRequestbuilder.bucket(bucketName)
                     .key(blobName)
                     .uploadId(uploadId.get())
                     .partNumber(i)
                     .contentLength((i < nbParts) ? partSize : lastPartSize)
+                    .sdkPartType((i < nbParts) ? null : SdkPartType.LAST)
                     .overrideConfiguration(o -> o.addMetricPublisher(blobStore.getStatsMetricPublisher().multipartUploadMetricCollector))
                     .build();
 

@@ -36,6 +36,7 @@ import org.opensearch.client.Client;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.RepositoryMetadata;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.crypto.CryptoSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
@@ -92,10 +93,11 @@ public class S3RepositoryPlugin extends Plugin implements RepositoryPlugin, Relo
     private static final String LOW_TRANSFER_QUEUE_CONSUMER = "low_transfer_queue_consumer";
     private static final String NORMAL_TRANSFER_QUEUE_CONSUMER = "normal_transfer_queue_consumer";
 
-    protected final S3Service service;
-    protected final S3AsyncService s3AsyncService;
+    protected static S3Service service;
+    protected static S3AsyncService s3AsyncService ;
 
-    private final Path configPath;
+    private static Settings settings;
+    private static Path configPath;
 
     protected AsyncExecutorContainer urgentExecutorBuilder;
     protected AsyncExecutorContainer priorityExecutorBuilder;
@@ -108,7 +110,8 @@ public class S3RepositoryPlugin extends Plugin implements RepositoryPlugin, Relo
     protected GenericStatsMetricPublisher genericStatsMetricPublisher;
 
     public S3RepositoryPlugin(final Settings settings, final Path configPath) {
-        this(settings, configPath, new S3Service(configPath), new S3AsyncService(configPath));
+        S3RepositoryPlugin.configPath = configPath;
+        S3RepositoryPlugin.settings = settings;
     }
 
     @Override
@@ -169,15 +172,11 @@ public class S3RepositoryPlugin extends Plugin implements RepositoryPlugin, Relo
         return (numberOfProcessors + 1) / 2;
     }
 
-    S3RepositoryPlugin(final Settings settings, final Path configPath, final S3Service service, final S3AsyncService s3AsyncService) {
-        this.service = Objects.requireNonNull(service, "S3 service must not be null");
-        this.configPath = configPath;
-        // eagerly load client settings so that secure settings are read
-        Map<String, S3ClientSettings> clientsSettings = S3ClientSettings.load(settings, configPath);
-        this.s3AsyncService = Objects.requireNonNull(s3AsyncService, "S3AsyncService must not be null");
-        this.service.refreshAndClearCache(clientsSettings);
-        this.s3AsyncService.refreshAndClearCache(clientsSettings);
-    }
+//    S3RepositoryPlugin(final Settings settings, final Path configPath) {
+//        this.configPath = configPath;
+//        this.settings = settings;
+//        // eagerly load client settings so that secure settings are read
+//    }
 
     private static int boundedBy(int value, int min, int max) {
         return Math.min(max, Math.max(min, value));
@@ -213,6 +212,12 @@ public class S3RepositoryPlugin extends Plugin implements RepositoryPlugin, Relo
         final IndexNameExpressionResolver expressionResolver,
         final Supplier<RepositoriesService> repositoriesServiceSupplier
     ) {
+        Map<String, S3ClientSettings> clientsSettings = S3ClientSettings.load(settings, configPath);
+        service = new S3Service(CryptoSettings.getInstance(), configPath);
+        service.refreshAndClearCache(clientsSettings);
+
+        s3AsyncService = new S3AsyncService(CryptoSettings.getInstance(), configPath);
+        s3AsyncService.refreshAndClearCache(clientsSettings);
         int urgentEventLoopThreads = urgentPoolCount(clusterService.getSettings());
         int priorityEventLoopThreads = priorityPoolCount(clusterService.getSettings());
         int normalEventLoopThreads = normalPoolCount(clusterService.getSettings());

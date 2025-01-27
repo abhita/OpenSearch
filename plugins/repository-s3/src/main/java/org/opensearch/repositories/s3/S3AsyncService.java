@@ -8,6 +8,8 @@
 
 package org.opensearch.repositories.s3;
 
+import org.opensearch.common.crypto.CryptoSettings;
+import org.opensearch.common.crypto.EncryptionProvider;
 import software.amazon.awssdk.auth.credentials.AwsCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.ContainerCredentialsProvider;
@@ -26,8 +28,7 @@ import software.amazon.awssdk.http.nio.netty.NettyNioAsyncHttpClient;
 import software.amazon.awssdk.http.nio.netty.ProxyConfiguration;
 import software.amazon.awssdk.http.nio.netty.SdkEventLoopGroup;
 import software.amazon.awssdk.regions.Region;
-import software.amazon.awssdk.services.s3.S3AsyncClient;
-import software.amazon.awssdk.services.s3.S3AsyncClientBuilder;
+import software.amazon.awssdk.services.s3.*;
 import software.amazon.awssdk.services.sts.StsClient;
 import software.amazon.awssdk.services.sts.StsClientBuilder;
 import software.amazon.awssdk.services.sts.auth.StsAssumeRoleCredentialsProvider;
@@ -45,6 +46,7 @@ import org.opensearch.core.common.Strings;
 import org.opensearch.repositories.s3.S3ClientSettings.IrsaCredentials;
 import org.opensearch.repositories.s3.async.AsyncExecutorContainer;
 import org.opensearch.repositories.s3.async.AsyncTransferEventLoopGroup;
+import software.amazon.encryption.s3.S3AsyncEncryptionClient;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -64,6 +66,8 @@ class S3AsyncService implements Closeable {
 
     private volatile Map<S3ClientSettings, AmazonAsyncS3Reference> clientsCache = emptyMap();
 
+    private CryptoSettings cryptoSettings;
+
     /**
      * Client settings calculated from static configuration and settings in the keystore.
      */
@@ -76,6 +80,13 @@ class S3AsyncService implements Closeable {
     private volatile Map<Settings, S3ClientSettings> derivedClientSettings = emptyMap();
 
     S3AsyncService(final Path configPath) {
+        staticClientSettings = MapBuilder.<String, S3ClientSettings>newMapBuilder()
+            .put("default", S3ClientSettings.getClientSettings(Settings.EMPTY, "default", configPath))
+            .immutableMap();
+    }
+
+    S3AsyncService(CryptoSettings cryptoSettings, final Path configPath) {
+        this.cryptoSettings = cryptoSettings;
         staticClientSettings = MapBuilder.<String, S3ClientSettings>newMapBuilder()
             .put("default", S3ClientSettings.getClientSettings(Settings.EMPTY, "default", configPath))
             .immutableMap();
@@ -121,7 +132,7 @@ class S3AsyncService implements Closeable {
             }
 
             final AmazonAsyncS3Reference clientReference = new AmazonAsyncS3Reference(
-                buildClient(clientSettings, urgentExecutorBuilder, priorityExecutorBuilder, normalExecutorBuilder)
+                buildS3EncryptedClient(clientSettings, urgentExecutorBuilder, priorityExecutorBuilder, normalExecutorBuilder)
             );
             clientReference.incRef();
             clientsCache = MapBuilder.newMapBuilder(clientsCache).put(clientSettings, clientReference).immutableMap();
@@ -172,7 +183,7 @@ class S3AsyncService implements Closeable {
         AsyncExecutorContainer normalExecutorBuilder
     ) {
         setDefaultAwsProfilePath();
-        final S3AsyncClientBuilder builder = S3AsyncClient.builder();
+        final S3AsyncClientBuilder builder = S3AsyncClientBuilder.builder();
         builder.overrideConfiguration(buildOverrideConfiguration(clientSettings));
         final AwsCredentialsProvider credentials = buildCredentials(logger, clientSettings);
         builder.credentialsProvider(credentials);
@@ -207,7 +218,7 @@ class S3AsyncService implements Closeable {
                 )
                 .build()
         );
-        final S3AsyncClient urgentClient = SocketAccess.doPrivileged(builder::build);
+        final S3AsyncEncryptionClient urgentClient = SocketAccess.doPrivileged(builder::build);
 
         builder.httpClient(buildHttpClient(clientSettings, priorityExecutorBuilder.getAsyncTransferEventLoopGroup()));
         builder.asyncConfiguration(
@@ -218,7 +229,7 @@ class S3AsyncService implements Closeable {
                 )
                 .build()
         );
-        final S3AsyncClient priorityClient = SocketAccess.doPrivileged(builder::build);
+        final S3AsyncEncryptionClient priorityClient = SocketAccess.doPrivileged(builder::build);
 
         builder.httpClient(buildHttpClient(clientSettings, normalExecutorBuilder.getAsyncTransferEventLoopGroup()));
         builder.asyncConfiguration(
@@ -229,9 +240,73 @@ class S3AsyncService implements Closeable {
                 )
                 .build()
         );
-        final S3AsyncClient client = SocketAccess.doPrivileged(builder::build);
+        final S3AsyncEncryptionClient client = SocketAccess.doPrivileged(builder::build);
 
         return AmazonAsyncS3WithCredentials.create(client, priorityClient, urgentClient, credentials);
+    }
+
+
+    synchronized AmazonAsyncS3WithCredentials buildS3EncryptedClient(
+        final S3ClientSettings clientSettings,
+        AsyncExecutorContainer urgentExecutorBuilder,
+        AsyncExecutorContainer priorityExecutorBuilder,
+        AsyncExecutorContainer normalExecutorBuilder
+    ) {
+        setDefaultAwsProfilePath();
+        final S3AsyncEncryptionClient.Builder urgentClientBuilder = S3AsyncEncryptionClient.builder();
+        addCommonBuilderConfigs(urgentClientBuilder,clientSettings, urgentExecutorBuilder);
+        final S3AsyncEncryptionClient urgentClient = SocketAccess.doPrivileged(urgentClientBuilder::build);
+
+        final S3AsyncEncryptionClient.Builder priorityClientBuilder = S3AsyncEncryptionClient.builder();
+        addCommonBuilderConfigs(priorityClientBuilder,clientSettings,priorityExecutorBuilder);
+        final S3AsyncEncryptionClient priorityClient = SocketAccess.doPrivileged(priorityClientBuilder::build);
+
+        final S3AsyncEncryptionClient.Builder clientBuilder = S3AsyncEncryptionClient.builder();
+        addCommonBuilderConfigs(clientBuilder,clientSettings,normalExecutorBuilder);
+        final S3AsyncEncryptionClient client = SocketAccess.doPrivileged(clientBuilder::build);
+
+        return AmazonAsyncS3WithCredentials.create(client, priorityClient, urgentClient, buildCredentials(logger, clientSettings));
+    }
+
+    private void addCommonBuilderConfigs(final S3AsyncEncryptionClient.Builder builder, final S3ClientSettings clientSettings, AsyncExecutorContainer executorContainer) {
+        builder.overrideConfiguration(buildOverrideConfiguration(clientSettings));
+        builder.kmsKeyId(cryptoSettings.getCryptoKeys(EncryptionProvider.KMS_KEY_ID));
+        final AwsCredentialsProvider credentials = buildCredentials(logger, clientSettings);
+        builder.credentialsProvider(credentials);
+        builder.serviceConfiguration(S3Configuration.builder().checksumValidationEnabled(true).build());
+
+        String endpoint = Strings.hasLength(clientSettings.endpoint) ? clientSettings.endpoint : DEFAULT_S3_ENDPOINT;
+        if ((endpoint.startsWith("http://") || endpoint.startsWith("https://")) == false) {
+            // Manually add the schema to the endpoint to work around https://github.com/aws/aws-sdk-java/issues/2274
+            endpoint = clientSettings.protocol.toString() + "://" + endpoint;
+        }
+        logger.debug("using endpoint [{}] and region [{}]", endpoint, clientSettings.region);
+
+        // If the endpoint configuration isn't set on the builder then the default behaviour is to try
+        // and work out what region we are in and use an appropriate endpoint - see AwsClientBuilder#setRegion.
+        // In contrast, directly-constructed clients use s3.amazonaws.com unless otherwise instructed. We currently
+        // use a directly-constructed client, and need to keep the existing behaviour to avoid a breaking change,
+        // so to move to using the builder we must set it explicitly to keep the existing behaviour.
+        //
+        // We do this because directly constructing the client is deprecated (was already deprecated in 1.1.223 too)
+        // so this change removes that usage of a deprecated API.
+        builder.endpointOverride(URI.create(endpoint));
+        builder.region(Region.of(clientSettings.region));
+        if (clientSettings.pathStyleAccess) {
+            builder.forcePathStyle(true);
+        }
+        builder.httpClient(buildHttpClient(clientSettings, executorContainer.getAsyncTransferEventLoopGroup()));
+
+        builder.asyncConfiguration(
+            ClientAsyncConfiguration.builder()
+                .advancedOption(
+                    SdkAdvancedAsyncClientOption.FUTURE_COMPLETION_EXECUTOR,
+                    executorContainer.getFutureCompletionExecutor()
+                )
+                .build()
+        );
+        builder.kmsKeyId(cryptoSettings.getCryptoKeys(EncryptionProvider.KMS_KEY_ID));
+
     }
 
     static ClientOverrideConfiguration buildOverrideConfiguration(final S3ClientSettings clientSettings) {

@@ -56,6 +56,7 @@ import java.util.function.Supplier;
 import java.util.stream.IntStream;
 
 import com.jcraft.jzlib.JZlib;
+import software.amazon.encryption.s3.S3AsyncEncryptionClient;
 
 /**
  * A helper class that automatically uses multipart upload based on the size of the source object
@@ -107,7 +108,7 @@ public final class AsyncTransferManager {
      * @return A {@link CompletableFuture} to listen for upload completion
      */
     public CompletableFuture<Void> uploadObject(
-        S3AsyncClient s3AsyncClient,
+        S3AsyncEncryptionClient s3AsyncClient,
         UploadRequest uploadRequest,
         StreamContext streamContext,
         StatsMetricPublisher statsMetricPublisher
@@ -345,7 +346,7 @@ public final class AsyncTransferManager {
 
     @SuppressWarnings("unchecked")
     private void uploadInOneChunk(
-        S3AsyncClient s3AsyncClient,
+        S3AsyncEncryptionClient s3AsyncClient,
         UploadRequest uploadRequest,
         StreamContext streamContext,
         CompletableFuture<Void> returnFuture,

@@ -32,6 +32,8 @@
 
 package org.opensearch.repositories.s3;
 
+import org.opensearch.common.crypto.CryptoSettings;
+import org.opensearch.common.crypto.EncryptionProvider;
 import software.amazon.awssdk.auth.credentials.AwsCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.ContainerCredentialsProvider;
@@ -53,12 +55,13 @@ import software.amazon.awssdk.profiles.ProfileFileSystemSetting;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ClientBuilder;
+import software.amazon.awssdk.services.s3.S3Configuration;
 import software.amazon.awssdk.services.sts.StsClient;
 import software.amazon.awssdk.services.sts.StsClientBuilder;
 import software.amazon.awssdk.services.sts.auth.StsAssumeRoleCredentialsProvider;
 import software.amazon.awssdk.services.sts.auth.StsWebIdentityTokenFileCredentialsProvider;
 import software.amazon.awssdk.services.sts.model.AssumeRoleRequest;
-
+import software.amazon.encryption.s3.S3EncryptionClient;
 import org.apache.http.conn.ssl.DefaultHostnameVerifier;
 import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.protocol.HttpContext;
@@ -102,6 +105,8 @@ class S3Service implements Closeable {
 
     private static final String DEFAULT_S3_ENDPOINT = "s3.amazonaws.com";
 
+    private CryptoSettings cryptoSettings;
+
     private volatile Map<S3ClientSettings, AmazonS3Reference> clientsCache = new ConcurrentHashMap<>();
 
     /**
@@ -116,6 +121,13 @@ class S3Service implements Closeable {
     private volatile Map<Settings, S3ClientSettings> derivedClientSettings = new ConcurrentHashMap<>();
 
     S3Service(final Path configPath) {
+        staticClientSettings = MapBuilder.<String, S3ClientSettings>newMapBuilder()
+            .put("default", S3ClientSettings.getClientSettings(Settings.EMPTY, "default", configPath))
+            .immutableMap();
+    }
+
+    S3Service(CryptoSettings cryptoSettings, final Path configPath) {
+        this.cryptoSettings = cryptoSettings;
         staticClientSettings = MapBuilder.<String, S3ClientSettings>newMapBuilder()
             .put("default", S3ClientSettings.getClientSettings(Settings.EMPTY, "default", configPath))
             .immutableMap();
@@ -154,7 +166,7 @@ class S3Service implements Closeable {
             if (existing != null && existing.tryIncRef()) {
                 return existing;
             }
-            final AmazonS3Reference clientReference = new AmazonS3Reference(buildClient(clientSettings));
+            final AmazonS3Reference clientReference = new AmazonS3Reference(buildS3EncryptedClient(clientSettings));
             clientReference.incRef();
             clientsCache = MapBuilder.newMapBuilder(clientsCache).put(clientSettings, clientReference).immutableMap();
             return clientReference;
@@ -233,6 +245,50 @@ class S3Service implements Closeable {
             builder.serviceConfiguration(s -> s.chunkedEncodingEnabled(false));
         }
         final S3Client client = SocketAccess.doPrivileged(builder::build);
+        return AmazonS3WithCredentials.create(client, credentials);
+    }
+
+    AmazonS3WithCredentials buildS3EncryptedClient(final S3ClientSettings clientSettings) {
+        setDefaultAwsProfilePath();
+
+        final S3EncryptionClient.Builder builder = S3EncryptionClient.builder();
+        final AwsCredentialsProvider credentials = buildCredentials(logger, clientSettings);
+        builder.credentialsProvider(credentials);
+        builder.httpClientBuilder(buildHttpClient(clientSettings));
+        builder.overrideConfiguration(buildOverrideConfiguration(clientSettings));
+
+        String endpoint = Strings.hasLength(clientSettings.endpoint) ? clientSettings.endpoint : DEFAULT_S3_ENDPOINT;
+        if ((endpoint.startsWith("http://") || endpoint.startsWith("https://")) == false) {
+            // Manually add the schema to the endpoint to work around https://github.com/aws/aws-sdk-java/issues/2274
+            // TODO: Remove this once fixed in the AWS SDK
+            endpoint = clientSettings.protocol.toString() + "://" + endpoint;
+        }
+        logger.debug("using endpoint [{}] and region [{}]", endpoint, clientSettings.region);
+
+        // If the endpoint configuration isn't set on the builder then the default behaviour is to try
+        // and work out what region we are in and use an appropriate endpoint - see AwsClientBuilder#setRegion.
+        // In contrast, directly-constructed clients use s3.amazonaws.com unless otherwise instructed. We currently
+        // use a directly-constructed client, and need to keep the existing behaviour to avoid a breaking change,
+        // so to move to using the builder we must set it explicitly to keep the existing behaviour.
+        //
+        // We do this because directly constructing the client is deprecated (was already deprecated in 1.1.223 too)
+        // so this change removes that usage of a deprecated API.
+        builder.endpointOverride(URI.create(endpoint));
+        if (Strings.hasText(clientSettings.region)) {
+            builder.region(Region.of(clientSettings.region));
+        }
+        if (clientSettings.pathStyleAccess) {
+            builder.forcePathStyle(true);
+        }
+        if (clientSettings.disableChunkedEncoding) {
+            builder.serviceConfiguration(s -> s.chunkedEncodingEnabled(false));
+        }
+
+        builder.serviceConfiguration(S3Configuration.builder().checksumValidationEnabled(false).build());
+        builder.kmsKeyId(cryptoSettings.getCryptoKeys(EncryptionProvider.KMS_KEY_ID));
+        logger.info("KMS KEY FROM CRYPTO SETTINGSS: "+cryptoSettings.getCryptoKeys(EncryptionProvider.KMS_KEY_ID));
+        final S3EncryptionClient client = SocketAccess.doPrivileged(builder::build);
+
         return AmazonS3WithCredentials.create(client, credentials);
     }
 
