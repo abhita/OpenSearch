@@ -108,7 +108,7 @@ public final class AsyncTransferManager {
      * @return A {@link CompletableFuture} to listen for upload completion
      */
     public CompletableFuture<Void> uploadObject(
-        S3AsyncEncryptionClient s3AsyncClient,
+        S3AsyncClient s3AsyncClient,
         UploadRequest uploadRequest,
         StreamContext streamContext,
         StatsMetricPublisher statsMetricPublisher
@@ -346,7 +346,7 @@ public final class AsyncTransferManager {
 
     @SuppressWarnings("unchecked")
     private void uploadInOneChunk(
-        S3AsyncEncryptionClient s3AsyncClient,
+        S3AsyncClient s3AsyncClient,
         UploadRequest uploadRequest,
         StreamContext streamContext,
         CompletableFuture<Void> returnFuture,

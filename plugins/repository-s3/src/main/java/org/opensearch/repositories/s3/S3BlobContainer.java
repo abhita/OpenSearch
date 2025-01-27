@@ -239,7 +239,7 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
             StreamContext streamContext = SocketAccess.doPrivileged(() -> writeContext.getStreamProvider(partSize));
             try (AmazonAsyncS3Reference amazonS3Reference = SocketAccess.doPrivileged(blobStore::asyncClientReference)) {
 
-                S3AsyncEncryptionClient s3AsyncClient;
+                S3AsyncClient s3AsyncClient;
                 if (writeContext.getWritePriority() == WritePriority.URGENT) {
                     s3AsyncClient = amazonS3Reference.get().urgentClient();
                 } else if (writeContext.getWritePriority() == WritePriority.HIGH) {
@@ -279,7 +279,7 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
     }
 
     private CompletableFuture<Void> createFileCompletableFuture(
-        S3AsyncEncryptionClient s3AsyncClient,
+        S3AsyncClient s3AsyncClient,
         UploadRequest uploadRequest,
         StreamContext streamContext,
         ActionListener<Void> completionListener

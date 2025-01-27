@@ -183,7 +183,7 @@ class S3AsyncService implements Closeable {
         AsyncExecutorContainer normalExecutorBuilder
     ) {
         setDefaultAwsProfilePath();
-        final S3AsyncClientBuilder builder = S3AsyncClientBuilder.builder();
+        final S3AsyncClientBuilder builder = S3AsyncClient.builder();
         builder.overrideConfiguration(buildOverrideConfiguration(clientSettings));
         final AwsCredentialsProvider credentials = buildCredentials(logger, clientSettings);
         builder.credentialsProvider(credentials);
@@ -218,7 +218,7 @@ class S3AsyncService implements Closeable {
                 )
                 .build()
         );
-        final S3AsyncEncryptionClient urgentClient = SocketAccess.doPrivileged(builder::build);
+        final S3AsyncClient urgentClient = SocketAccess.doPrivileged(builder::build);
 
         builder.httpClient(buildHttpClient(clientSettings, priorityExecutorBuilder.getAsyncTransferEventLoopGroup()));
         builder.asyncConfiguration(
@@ -229,7 +229,7 @@ class S3AsyncService implements Closeable {
                 )
                 .build()
         );
-        final S3AsyncEncryptionClient priorityClient = SocketAccess.doPrivileged(builder::build);
+        final S3AsyncClient priorityClient = SocketAccess.doPrivileged(builder::build);
 
         builder.httpClient(buildHttpClient(clientSettings, normalExecutorBuilder.getAsyncTransferEventLoopGroup()));
         builder.asyncConfiguration(
@@ -240,7 +240,7 @@ class S3AsyncService implements Closeable {
                 )
                 .build()
         );
-        final S3AsyncEncryptionClient client = SocketAccess.doPrivileged(builder::build);
+        final S3AsyncClient client = SocketAccess.doPrivileged(builder::build);
 
         return AmazonAsyncS3WithCredentials.create(client, priorityClient, urgentClient, credentials);
     }
