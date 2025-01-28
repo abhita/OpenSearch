@@ -54,6 +54,10 @@ commonsio         = "2.16.0"
 # plugin dependencies
 aws               = "2.20.86"
 reactivestreams   = "1.0.4"
+jakarta_soap      = "3.0.1"
+saaj_impl         = "3.0.2"
+staxex            = "2.1.0"
+s3encyrption      = "3.2.3"
 
 # when updating this version, you need to ensure compatibility with:
 #  - plugins/ingest-attachment (transitive dependency, check the upstream POM)
