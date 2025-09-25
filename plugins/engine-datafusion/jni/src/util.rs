@@ -5,13 +5,18 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use datafusion::arrow::array::RecordBatch;
+use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
+use datafusion::datasource::physical_plan::parquet::CachedParquetMetaData;
+use datafusion::execution::cache::cache_manager::FileMetadata;
 use jni::objects::{JObject, JObjectArray, JString};
 use jni::sys::jlong;
 use jni::JNIEnv;
-use object_store::{path::Path as ObjectPath, ObjectMeta};
+use object_store::{path::Path as ObjectPath, ObjectMeta, ObjectStore};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
+use std::sync::Arc;
+use object_store::{local::LocalFileSystem};
 
 /// Set error message from a result using a Consumer<String> Java callback
 pub fn set_error_message_batch<Err: Error>(env: &mut JNIEnv, callback: JObject, result: Result<Vec<RecordBatch>, Err>) {
@@ -90,7 +95,6 @@ pub fn set_object_result_error<T: Error>(env: &mut JNIEnv, callback: JObject, er
         .expect("Failed to call object result callback with error");
 }
 
-
 /// Parse a string map from JNI arrays
 pub fn parse_string_map(
     env: &mut JNIEnv,
@@ -159,20 +163,44 @@ pub fn throw_exception(env: &mut JNIEnv, message: &str) {
 
 pub fn create_object_meta_from_filenames(base_path: &str, filenames: Vec<String>) -> Vec<ObjectMeta> {
     filenames.into_iter().map(|filename| {
-        let filename = filename.as_str();
         let full_path = format!("{}/{}", base_path.trim_end_matches('/'), filename);
-        let file_size = fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
-        let modified = fs::metadata(&full_path)
-            .and_then(|m| m.modified())
-            .map(|t| DateTime::<Utc>::from(t))
-            .unwrap_or_else(|_| Utc::now());
-
-        ObjectMeta {
-            location: ObjectPath::from(filename),
-            last_modified: modified,
-            size: file_size,
-            e_tag: None,
-            version: None,
-        }
+        create_object_meta_from_file(&full_path)
     }).collect()
+}
+
+pub fn create_object_meta_from_file(file_path: &str) -> ObjectMeta {
+    let file_size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+    let modified = fs::metadata(&file_path)
+        .and_then(|m| m.modified())
+        .map(|t| DateTime::<Utc>::from(t))
+        .unwrap_or_else(|_| Utc::now());
+
+    ObjectMeta {
+        location: ObjectPath::from(file_path),
+        last_modified: modified,
+        size: file_size,
+        e_tag: None,
+        version: None,
+    }
+}
+
+// Utility method to construct file metadata using DataFusion's DFParquetMetadata
+pub async fn construct_file_metadata(
+    store: &dyn ObjectStore,
+    object_meta: &ObjectMeta,
+    data_format: &str,
+) -> Result<Arc<dyn FileMetadata>, Box<dyn std::error::Error>> {
+    match data_format.to_lowercase().as_str() {
+        "parquet" => {
+            let df_metadata = DFParquetMetadata::new(
+                store,
+                object_meta
+            );
+
+            let parquet_metadata = df_metadata.fetch_metadata().await?;
+            let par = CachedParquetMetaData::new(parquet_metadata);
+            Ok(Arc::new(par))
+        },
+        _ => Err(format!("Unsupported data format: {}", data_format).into())
+    }
 }
