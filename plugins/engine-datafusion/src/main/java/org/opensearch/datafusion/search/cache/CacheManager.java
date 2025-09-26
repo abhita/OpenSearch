@@ -77,7 +77,7 @@ public class CacheManager implements AutoCloseable {
         boolean allSuccessful = true;
         for (CacheAccessor cache : getAllCaches()) {
             for (String filename : files) {
-                allSuccessful &= cache.remove(path.concat(filename));
+                allSuccessful &= cache.remove(path.concat("/"+filename));
             }
         }
 

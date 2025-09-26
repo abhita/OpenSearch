@@ -10,15 +10,12 @@ package org.opensearch.datafusion;
 
 import java.util.HashSet;
 import java.util.Set;
-import org.opensearch.cluster.routing.allocation.DiskThresholdSettings;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.datafusion.search.cache.CacheAccessor;
 import org.opensearch.datafusion.search.cache.CacheManager;
 import org.opensearch.datafusion.search.cache.CacheType;
-import org.opensearch.index.IndexModule;
-import org.opensearch.index.store.remote.filecache.FileCacheSettings;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.Collections;
@@ -26,12 +23,8 @@ import java.util.List;
 
 import static org.opensearch.common.settings.ClusterSettings.BUILT_IN_CLUSTER_SETTINGS;
 import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_ENABLED;
-import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_ENABLED_KEY;
 import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_EVICTION_TYPE;
 import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_SIZE_LIMIT;
-import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_SIZE_LIMIT_KEY;
-import static org.opensearch.index.IndexModule.INDEX_STORE_LOCALITY_SETTING;
-import static org.opensearch.index.IndexModule.IS_WARM_INDEX_SETTING;
 
 /**
  * Unit tests for DataFusionService
