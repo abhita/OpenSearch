@@ -17,6 +17,7 @@ import org.opensearch.datafusion.search.DatafusionReader;
 import org.opensearch.datafusion.search.DatafusionReaderManager;
 import org.opensearch.datafusion.search.DatafusionSearcher;
 import org.opensearch.datafusion.search.DatafusionSearcherSupplier;
+import org.opensearch.datafusion.search.cache.CacheManager;
 import org.opensearch.index.engine.CatalogSnapshotAwareRefreshListener;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineException;
@@ -40,10 +41,17 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
 
     private DataFormat dataFormat;
     private DatafusionReaderManager datafusionReaderManager;
+    private CacheManager cacheManager;
 
-    public DatafusionEngine(DataFormat dataFormat, Collection<FileMetadata> formatCatalogSnapshot) throws IOException {
+    public DatafusionEngine(DataFormat dataFormat, CacheManager cacheManager, Collection<FileMetadata> formatCatalogSnapshot) throws IOException {
         this.dataFormat = dataFormat;
         this.datafusionReaderManager = new DatafusionReaderManager("TODO://FigureOutPath", formatCatalogSnapshot);
+        this.cacheManager = cacheManager;
+        // Set up callbacks when creating the reader manager
+        datafusionReaderManager.setOnFilesAdded(files -> {
+            // Handle new files added during refresh
+            cacheManager.addToCache("TODO://FigureOutPath",files);
+        });
     }
 
     @Override
@@ -85,6 +93,7 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
                 @Override
                 protected void doClose() {
                     try {
+                        cacheManager.removeFilesByDirectory("TODO://FigureOutPath");
                         reader.decRef();
                     } catch (IOException e) {
                         throw new UncheckedIOException(e);

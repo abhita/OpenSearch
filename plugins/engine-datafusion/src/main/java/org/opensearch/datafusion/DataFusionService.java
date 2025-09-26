@@ -11,9 +11,11 @@ package org.opensearch.datafusion;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.util.concurrent.ConcurrentCollections;
 import org.opensearch.common.util.concurrent.ConcurrentMapLong;
 import org.opensearch.datafusion.core.GlobalRuntimeEnv;
+import org.opensearch.datafusion.search.cache.CacheManager;
 import org.opensearch.vectorized.execution.search.DataFormat;
 import org.opensearch.vectorized.execution.search.spi.DataSourceCodec;
 import org.opensearch.vectorized.execution.search.spi.RecordBatchStream;
@@ -32,16 +34,25 @@ public class DataFusionService extends AbstractLifecycleComponent {
 
     private final DataSourceRegistry dataSourceRegistry;
     private final GlobalRuntimeEnv globalRuntimeEnv;
+    private final CacheManager cacheManager;
+
+    /**
+     * Get the cache manager instance
+     * @return CacheManager instance
+     */
+    public CacheManager getCacheManager() {
+        return cacheManager;
+    }
 
     /**
      * Creates a new DataFusion service instance.
      */
-    public DataFusionService(Map<DataFormat, DataSourceCodec> dataSourceCodecs) {
+    public DataFusionService(Map<DataFormat, DataSourceCodec> dataSourceCodecs, ClusterSettings settings) {
         this.dataSourceRegistry = new DataSourceRegistry(dataSourceCodecs);
-
         // to verify jni
         String version = DataFusionQueryJNI.getVersionInfo();
-        this.globalRuntimeEnv = new GlobalRuntimeEnv();
+        this.cacheManager = CacheManager.fromConfig(settings);
+        this.globalRuntimeEnv = new GlobalRuntimeEnv(cacheManager.getCacheManagerPtr());
     }
 
     @Override

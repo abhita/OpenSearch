@@ -8,11 +8,14 @@
 
 package org.opensearch.datafusion;
 
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.IndexScopedSettings;
+import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
@@ -24,9 +27,9 @@ import org.opensearch.datafusion.search.DatafusionContext;
 import org.opensearch.datafusion.search.DatafusionQuery;
 import org.opensearch.datafusion.search.DatafusionReaderManager;
 import org.opensearch.datafusion.search.DatafusionSearcher;
+import org.opensearch.datafusion.search.cache.CacheSettings;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
-import org.opensearch.search.ContextEngineSearcher;
 import org.opensearch.index.engine.SearchExecEngine;
 import org.opensearch.index.engine.exec.FileMetadata;
 import org.opensearch.plugins.ActionPlugin;
@@ -40,7 +43,6 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.vectorized.execution.search.DataFormat;
 import org.opensearch.vectorized.execution.search.spi.DataSourceCodec;
-import org.opensearch.vectorized.execution.search.spi.RecordBatchStream;
 import org.opensearch.watcher.ResourceWatcherService;
 
 import java.io.IOException;
@@ -49,6 +51,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
+
+import static org.opensearch.datafusion.search.cache.CacheType.METADATA;
 
 /**
  * Main plugin class for OpenSearch DataFusion integration.
@@ -102,7 +106,7 @@ public class DataFusionPlugin extends Plugin implements ActionPlugin, SearchEngi
         if (!isDataFusionEnabled) {
             return Collections.emptyList();
         }
-        dataFusionService = new DataFusionService(dataSourceCodecs);
+        dataFusionService = new DataFusionService(dataSourceCodecs,clusterService.getClusterSettings());
 
         for(DataFormat format : this.getSupportedFormats()) {
             dataSourceCodecs.get(format);
@@ -125,7 +129,7 @@ public class DataFusionPlugin extends Plugin implements ActionPlugin, SearchEngi
     public SearchExecEngine<DatafusionContext, DatafusionSearcher,
             DatafusionReaderManager, DatafusionQuery>
         createEngine(DataFormat dataFormat,Collection<FileMetadata> formatCatalogSnapshot) throws IOException {
-        return new DatafusionEngine(dataFormat, formatCatalogSnapshot);
+        return new DatafusionEngine(dataFormat, dataFusionService.getCacheManager(),formatCatalogSnapshot);
     }
 
     /**
@@ -165,5 +169,12 @@ public class DataFusionPlugin extends Plugin implements ActionPlugin, SearchEngi
             return Collections.emptyList();
         }
         return List.of(new ActionHandler<>(NodesDataFusionInfoAction.INSTANCE, TransportNodesDataFusionInfoAction.class));
+    }
+
+    @Override
+    public List<Setting<?>> getSettings() {
+        return Stream.of(CacheSettings.CACHE_SETTINGS, CacheSettings.CACHE_ENABLED)
+            .flatMap(x -> x.stream())
+            .collect(Collectors.toList());
     }
 }

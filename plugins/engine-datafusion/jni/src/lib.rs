@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-use jni::objects::{JByteArray, JClass};
+use jni::objects::{JByteArray, JClass, JObject};
 use jni::sys::{jbyteArray, jlong, jstring};
 use jni::JNIEnv;
 use std::sync::Arc;
@@ -17,12 +17,12 @@ use datafusion::execution::context::SessionContext;
 
 use datafusion::DATAFUSION_VERSION;
 use datafusion::datasource::file_format::csv::CsvFormat;
-use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::execution::cache::cache_manager::{CacheManager, CacheManagerConfig, FileStatisticsCache};
+use datafusion::execution::cache::cache_manager::{CacheManager, CacheManagerConfig, FileMetadataCache, FileStatisticsCache};
+use datafusion::execution::cache::cache_unit::DefaultFilesMetadataCache;
 use datafusion::execution::disk_manager::DiskManagerConfig;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::SessionConfig;
-use crate::util::{create_object_meta_from_filenames, parse_string_arr};
+use crate::util::{create_object_meta_from_filenames, create_object_meta_from_file, parse_string_arr, construct_file_metadata};
 use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::execution::cache::cache_unit::DefaultListFilesCache;
 use datafusion::execution::cache::CacheAccessor;
@@ -33,6 +33,11 @@ use jni::objects::{JObjectArray, JString};
 use prost::Message;
 use tokio::runtime::Runtime;
 use object_store::ObjectMeta;
+use chrono::Utc;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::ops::Deref;
+
 
 /// Create a new DataFusion session context
 #[no_mangle]
@@ -103,7 +108,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createG
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createSessionContext(
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createSessionContextv1(
     _env: JNIEnv,
     _class: JClass,
     runtime_id: jlong,
@@ -261,7 +266,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_nativeE
             },
             Err(e) => {
                 println!("SUBSTRAIT Rust: Failed to convert Substrait plan: {}", e);
-                return;
+                return 0;
             }
         };
 
@@ -269,20 +274,18 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_nativeE
             .await.expect("Failed to run Logical Plan");
 
         // TODO : check if this works
-        return match dataframe.execute_stream() {
+        match dataframe.execute_stream().await {
             Ok(stream) => {
                 let boxed_stream = Box::new(stream);
                 let stream_ptr = Box::into_raw(boxed_stream);
                 stream_ptr as jlong
             },
             Err(e) => {
+                println!("SUBSTRAIT Rust: Failed to execute stream: {}", e);
                 0
             }
         }
     })
-
-
-    // Create DataFrame from the converted logical plan
 
 
 }
@@ -353,4 +356,170 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_nativeC
 
 
 
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_initCacheManagerConfig(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    let config = CacheManagerConfig::default();
+    Box::into_raw(Box::new(config)) as jlong
+}
 
+/// Create RuntimeEnv using the configured CacheManagerConfig
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createGlobalRuntimeWithConfig(
+    _env: JNIEnv,
+    _class: JClass,
+    config_ptr: jlong,
+) -> jlong {
+    // Take ownership of the CacheManagerConfig
+    let cache_manager_config = unsafe { Box::from_raw(config_ptr as *mut CacheManagerConfig) };
+
+    // Create RuntimeEnv with the configured cache manager
+    let runtime_env = RuntimeEnvBuilder::default()
+        .with_cache_manager(*cache_manager_config)
+        .build()
+        .unwrap();
+
+    Box::into_raw(Box::new(runtime_env)) as jlong
+}
+
+/// Create a metadata cache and add it to the CacheManagerConfig
+/// The config_ptr remains the same, only the contents are updated
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createMetadataCache(
+    _env: JNIEnv,
+    _class: JClass,
+    config_ptr: jlong,
+    size_limit: jlong,
+) -> jlong {
+    // Create the cache
+    let cache = Arc::new(DefaultFilesMetadataCache::new(size_limit.try_into().unwrap()));
+
+    // Update the CacheManagerConfig at the same memory location
+    if config_ptr != 0 {
+        let cache_manager_config = unsafe { &mut *(config_ptr as *mut CacheManagerConfig) };
+        // This replaces the contents at the same pointer location
+        *cache_manager_config = cache_manager_config.clone()
+            .with_file_metadata_cache(Some(cache.clone() as Arc<dyn FileMetadataCache>));
+    }
+
+    // Return the cache pointer
+    Box::into_raw(Box::new(cache)) as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_metadataCachePut(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+    file_path: JString,
+) -> i32 {
+    let file_path: String = match env.get_string(&file_path) {
+        Ok(s) => s.into(),
+        Err(_) => return -1,
+    };
+    let cache = unsafe { &mut *(cache_ptr as *mut Arc<DefaultFilesMetadataCache>) };
+    let data_format = if file_path.to_lowercase().ends_with(".parquet") {
+        "parquet"
+    } else {
+        return 0; // Skip unsupported formats
+    };
+
+    let object_meta = create_object_meta_from_file(&file_path);
+    let store = Arc::new(object_store::local::LocalFileSystem::new());
+
+    // Use Runtime to block on the async operation
+    let metadata = Runtime::new()
+        .expect("Failed to create Tokio Runtime")
+        .block_on(async {
+            construct_file_metadata(store.as_ref(), &object_meta, data_format)
+                .await
+                .expect("Failed to construct file metadata")
+        });
+
+    cache.put(&object_meta, metadata);
+
+    println!("Cached metadata for: {}", file_path);
+    1
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_metadataCacheRemove(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+    file_path: JString,
+) -> bool {
+    let file_path: String = match env.get_string(&file_path) {
+        Ok(s) => s.into(),
+        Err(_) => return false,
+    };
+    let cache = unsafe { &mut *(cache_ptr as *mut Arc<DefaultFilesMetadataCache>) };
+    let object_meta = create_object_meta_from_file(&file_path);
+
+    // Try to get mutable access if there's only one reference
+    if let Some(cache_mut) = Arc::get_mut(cache) {
+        cache_mut.remove(&object_meta);
+        println!("Cache removed for: {}", file_path);
+        true
+    } else {
+        // If there are multiple references, we can't remove the item
+        // This is a limitation of the current cache design
+        println!("Cannot remove from cache (multiple references exist): {}", file_path);
+        false
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_metadataCacheGet(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+    file_path: JString,
+) -> jlong {
+    let file_path: String = match env.get_string(&file_path) {
+        Ok(s) => s.into(),
+        Err(_) => return 0,
+    };
+
+    let cache = unsafe { &*(cache_ptr as *const Arc<DefaultFilesMetadataCache>) };
+    let object_meta = create_object_meta_from_file(&file_path);
+
+    match cache.get(&object_meta) {
+        Some(metadata) => {
+            println!("Retrieved metadata for: {} - size: {:?}", file_path, metadata.memory_size());
+            Box::into_raw(Box::new(metadata)) as jlong
+        },
+        None => {
+            println!("No metadata found for: {}", file_path);
+            0
+        },
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_metadataCacheContainsFile(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+    file_path: JString
+) -> bool {
+    let file_path: String = match env.get_string(&file_path) {
+        Ok(s) => s.into(),
+        Err(_) => return false
+    };
+    let cache = unsafe { &*(cache_ptr as *const Arc<DefaultFilesMetadataCache>) };
+    let object_meta = create_object_meta_from_file(&file_path);
+    cache.contains_key(&object_meta)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_metadataCacheGetSize(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong
+) -> usize {
+    let cache = unsafe { &*(cache_ptr as *const Arc<DefaultFilesMetadataCache>) };
+    cache.memory_used()
+}

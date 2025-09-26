@@ -50,6 +50,7 @@ import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.env.Environment;
 import org.opensearch.http.HttpServerTransport;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.plugins.DataSourcePlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.PluginInfo;
 import org.opensearch.plugins.SearchPlugin;
@@ -174,7 +175,8 @@ public class MockNode extends Node {
         Executor indexSearcherExecutor,
         TaskResourceTrackingService taskResourceTrackingService,
         Collection<ConcurrentSearchRequestDecider.Factory> concurrentSearchDeciderFactories,
-        List<SearchPlugin.ProfileMetricsProvider> pluginProfilers
+        List<SearchPlugin.ProfileMetricsProvider> pluginProfilers,
+        List<DataSourcePlugin> dataSourcePluginList
     ) {
         if (getPluginsService().filterPlugins(MockSearchService.TestPlugin.class).isEmpty()) {
             return super.newSearchService(
@@ -190,7 +192,8 @@ public class MockNode extends Node {
                 indexSearcherExecutor,
                 taskResourceTrackingService,
                 concurrentSearchDeciderFactories,
-                pluginProfilers
+                pluginProfilers,
+                null
             );
         }
         return new MockSearchService(

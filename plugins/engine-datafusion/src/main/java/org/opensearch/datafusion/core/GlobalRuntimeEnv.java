@@ -8,8 +8,11 @@
 
 package org.opensearch.datafusion.core;
 
+import org.opensearch.datafusion.search.cache.CacheManager;
+
 import static org.opensearch.datafusion.DataFusionQueryJNI.closeGlobalRuntime;
 import static org.opensearch.datafusion.DataFusionQueryJNI.createGlobalRuntime;
+import static org.opensearch.datafusion.DataFusionQueryJNI.createGlobalRuntimeWithConfig;
 
 /**
  * Global runtime environment for DataFusion operations.
@@ -26,6 +29,10 @@ public class GlobalRuntimeEnv implements AutoCloseable {
         this.ptr = createGlobalRuntime();
     }
 
+    public GlobalRuntimeEnv(long cacheManagerPtr) {
+        this.ptr = createGlobalRuntimeWithConfig(cacheManagerPtr);
+    }
+
     /**
      * Gets the native pointer to the runtime environment.
      * @return the native pointer
@@ -37,5 +44,6 @@ public class GlobalRuntimeEnv implements AutoCloseable {
     @Override
     public void close() {
         closeGlobalRuntime(this.ptr);
+
     }
 }
