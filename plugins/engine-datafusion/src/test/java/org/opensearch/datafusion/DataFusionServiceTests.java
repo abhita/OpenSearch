@@ -178,15 +178,12 @@ public class DataFusionServiceTests extends OpenSearchTestCase {
         CacheAccessor metadataCache = service.getCacheManager().getCacheAccessor(CacheType.METADATA);
 
         CacheManager cacheManager= service.getCacheManager();
-        String dirPath = "/Users/abhital/dev/src/forkedrepo/OpenSearch/plugins/engine-datafusion/src";
-        String fileName = "hits9_v1.parquet";
-
-        String filePath = dirPath + "/" + fileName;
+        String fileName = "/Users/abhital/dev/src/forkedrepo/OpenSearch/plugins/engine-datafusion/src/hits9_v1.parquet";
         // add File using CacheManager
-        cacheManager.addToCache(dirPath,List.of(fileName));
+        cacheManager.addToCache(List.of(fileName));
 
         // Get file using individual Cache Accessor Methods -> Prints Cache content size
-        assertTrue((Boolean) metadataCache.get(filePath));
+        assertTrue((Boolean) metadataCache.get(fileName));
 
         logger.info("Memory Consumed by MetadataCache : {}",metadataCache.getMemoryConsumed());
         logger.info("Memory Consumed by CacheManager : {}",cacheManager.getTotalUsedBytes());
@@ -194,26 +191,31 @@ public class DataFusionServiceTests extends OpenSearchTestCase {
         logger.info("Total Configured Size Limit for MetadataCache : {}",metadataCache.getConfiguredSizeLimit());
         logger.info("Total Configured Size Limit for CacheManager : {}",cacheManager.getTotalSizeLimit());
 
-        boolean removed = cacheManager.removeFiles(dirPath,List.of(fileName));
-        logger.info("Is file removed: {}. Contains File Check: {} Ideally remove will not work as we have multiple references",removed, metadataCache.containsFile(filePath));
-        logger.info("Memory Consumed by MetadataCache : {}",metadataCache.getMemoryConsumed());
-        logger.info("Memory Consumed by CacheManager : {}",cacheManager.getTotalUsedBytes());
+        boolean removed = cacheManager.removeFiles(List.of(fileName));
+        logger.info("Is file removed: {}. Contains File Check: {} ",removed, metadataCache.containsFile(fileName));
+        logger.info("Memory Consumed by MetadataCache after removing entries: {}",metadataCache.getMemoryConsumed());
+        logger.info("Memory Consumed by CacheManager after removing entries: {}",cacheManager.getTotalUsedBytes());
 
 
         // add File again to cache
-        cacheManager.addToCache(dirPath,List.of(fileName));
+        cacheManager.addToCache(List.of(fileName));
         logger.info("Entries in Metadata Cache : {}",cacheManager.getCacheAccessor(CacheType.METADATA).getEntries());
 
         // change cluster setting to update sizeLimit -> eventually evicts entries
         metadataCache.setSizeLimit(new ByteSizeValue(40));
         // file will be evicted as sizeLimit is decreased
-        logger.info("Entries in Metadata Cache : {}",cacheManager.getCacheAccessor(CacheType.METADATA).getEntries());
+        logger.info("Entries in Metadata Cache after sizeLimit exceeds: {}",cacheManager.getCacheAccessor(CacheType.METADATA).getEntries());
 
         // Add file again to test if cache clear works
-        metadataCache.put(filePath);
-        logger.info("Entries in Metadata Cache : {}",cacheManager.getCacheAccessor(CacheType.METADATA).getEntries());
+        metadataCache.put(fileName);
+        logger.info("Entries in Metadata Cache after put action with same sizeLimit: {}",cacheManager.getCacheAccessor(CacheType.METADATA).getEntries());
+
+        metadataCache.setSizeLimit(new ByteSizeValue(500000));
+        metadataCache.put(fileName);
+        logger.info("Entries in Metadata Cache after put action with updatedSizeLimit: {}",cacheManager.getCacheAccessor(CacheType.METADATA).getEntries());
+
         metadataCache.clear();
-        logger.info("Entries in Metadata Cache : {}",cacheManager.getCacheAccessor(CacheType.METADATA).getEntries());
+        logger.info("Entries in Metadata Cache after Cache Clear: {}",cacheManager.getCacheAccessor(CacheType.METADATA).getEntries());
 
     }
 }
