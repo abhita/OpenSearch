@@ -6,10 +6,11 @@
  * compatible open source license.
  */
 use std::ptr::addr_of_mut;
+use datafusion_expr::expr_rewriter::unalias;
 use jni::objects::{JByteArray, JClass, JObject};
 use jni::sys::{jbyteArray, jlong, jstring};
 use jni::JNIEnv;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use arrow_array::{Array, StructArray};
 use arrow_array::ffi::FFI_ArrowArray;
 use arrow_schema::DataType;
@@ -19,6 +20,7 @@ use std::time::Instant;
 mod util;
 mod row_id_optimizer;
 mod listing_table;
+mod cache;
 
 use datafusion::execution::context::SessionContext;
 
@@ -42,6 +44,17 @@ use prost::Message;
 use tokio::runtime::Runtime;
 use crate::listing_table::{ListingOptions, ListingTable, ListingTableConfig};
 use crate::row_id_optimizer::FilterRowIdOptimizer;
+use crate::metadata_cache::{MutexFileMetadataCache};
+use crate::util::{construct_file_metadata, create_object_meta_from_file, create_object_meta_from_filenames, parse_string_arr, set_object_result_error, set_object_result_ok};
+
+use datafusion::datasource::file_format::csv::CsvFormat;
+use datafusion::datasource::listing::{ListingTableUrl};
+use datafusion::execution::cache::cache_manager::{self, CacheManagerConfig, FileMetadataCache};
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
+use datafusion::datasource::physical_plan::FileMeta;
+use datafusion::execution::cache::cache_unit::{DefaultFilesMetadataCache, DefaultListFilesCache};
+use datafusion::execution::cache::CacheAccessor;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 
 /// Create a new DataFusion session context
 #[no_mangle]
@@ -123,6 +136,25 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createG
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createGlobalRuntimev1(
+    _env: JNIEnv,
+    _class: JClass,
+    cache_config_ptr: jlong,
+) -> jlong {
+        // Take ownership of the CacheManagerConfig
+    let cache_manager_config = unsafe { Box::from_raw(cache_config_ptr as *mut CacheManagerConfig) };
+
+    // Create RuntimeEnv with the configured cache manager
+    let runtime_env = RuntimeEnvBuilder::default()
+        .with_cache_manager(*cache_manager_config)
+        .build()
+        .unwrap();
+
+    let ptr =Box::into_raw(Box::new(runtime_env)) as jlong;
+    ptr
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createSessionContext(
     _env: JNIEnv,
     _class: JClass,
@@ -199,7 +231,6 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_execute
     mut env: JNIEnv,
     _class: JClass,
     shard_view_ptr: jlong,
-    table_name: JString,
     substrait_bytes: jbyteArray,
     tokio_runtime_env_ptr: jlong,
     // callback: JObject,

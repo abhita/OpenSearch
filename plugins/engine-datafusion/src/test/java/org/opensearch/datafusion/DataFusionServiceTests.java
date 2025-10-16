@@ -123,7 +123,6 @@ public class DataFusionServiceTests extends OpenSearchTestCase {
             DatafusionEngine engine = new DatafusionEngine(DataFormat.CSV, List.of(new FileMetadata(new TextDF(), "hits_data.parquet")), service);
             datafusionSearcher = engine.acquireSearcher("Search");
 
-
             byte[] protoContent;
 
             try (InputStream is = getClass().getResourceAsStream("/substrait_plan.pb")) {
@@ -132,7 +131,7 @@ public class DataFusionServiceTests extends OpenSearchTestCase {
                 throw new RuntimeException(e);
             }
 
-            long streamPointer = datafusionSearcher.search(new DatafusionQuery(protoContent, new ArrayList<>()), service.getTokioRuntimePointer());
+            long streamPointer = datafusionSearcher.search(new DatafusionQuery(protoContent, new ArrayList<>()), service.getTokioRuntimePointer(), service.getRuntimePointer());
             RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
             RecordBatchStream stream = new RecordBatchStream(streamPointer, service.getTokioRuntimePointer() , allocator);
 
