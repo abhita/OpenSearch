@@ -1,0 +1,1 @@
+MutexFileMetadataCache: datafusion::execution::cache::CacheAccessor<object_store::ObjectMeta, std::sync::Arc<(dyn datafusion::execution::cache::cache_manager::FileMetadata + 'static)>>
