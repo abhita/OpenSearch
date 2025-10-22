@@ -42,6 +42,10 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 
+# Cache policy dependencies
+instant = "0.1"
+dashmap = "5.5"
+
 # Logging
 log ={ workspace = true }
 # Parquet support

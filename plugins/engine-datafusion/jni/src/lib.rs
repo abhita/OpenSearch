@@ -23,6 +23,20 @@ mod listing_table;
 mod metadata_cache;
 
 use datafusion::execution::context::SessionContext;
+use datafusion::physical_plan::Statistics;
+use datafusion::common::stats::Precision;
+
+use crate::cache_policy::{CacheConfig, PolicyType};
+use crate::listing_table::{ListingOptions, ListingTable, ListingTableConfig};
+use crate::statistics_cache::CustomStatsCache;
+use crate::metadata_cache::MutexFileMetadataCache;
+use crate::row_id_optimizer::FilterRowIdOptimizer;
+use crate::util::{
+    construct_file_metadata, create_object_meta_from_file, create_object_meta_from_filenames,
+    parse_string_arr, set_object_result_error, set_object_result_ok,
+};
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionConfig;
 use datafusion::DATAFUSION_VERSION;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -198,7 +212,6 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_execute
     tokio_runtime_env_ptr: jlong,
     // callback: JObject,
 ) -> jlong {
-    let overall = Instant::now();
     let shard_view = unsafe { &*(shard_view_ptr as *const ShardView) };
     let runtime_ptr = unsafe { &*(tokio_runtime_env_ptr as *const Runtime)};
     let table_name: String = env.get_string(&table_name).expect("Couldn't get java string!").into();
@@ -682,18 +695,27 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createS
     config_ptr: jlong,
     size_limit: jlong,
 ) -> jlong {
-    // Create statistics cache directly (no mutex wrapper needed)
+    // Create memory-aware policy cache with default LRU policy
+    let config = CacheConfig {
+        policy_type: PolicyType::Lru,
+        size_limit: size_limit as usize,
+        eviction_threshold: 0.8,
+    };
+    let memory_aware_cache = CustomStatsCache::new(config);
+
+    // Create a new DefaultFileStatisticsCache for the CacheManagerConfig
     let stats_cache = Arc::new(DefaultFileStatisticsCache::default());
 
     // Update the CacheManagerConfig at the same memory location
     if config_ptr != 0 {
         let cache_manager_config = unsafe { &mut *(config_ptr as *mut CacheManagerConfig) };
-        *cache_manager_config = cache_manager_config.clone()
-            .with_files_statistics_cache(Some(stats_cache.clone()));
+        *cache_manager_config = cache_manager_config
+            .clone()
+            .with_files_statistics_cache(Some(stats_cache));
     }
 
-    // Return the DefaultFileStatisticsCache pointer for JNI operations
-    Box::into_raw(Box::new(stats_cache)) as jlong
+    // Return the CustomStatsCache pointer for JNI operations
+    Box::into_raw(Box::new(memory_aware_cache)) as jlong
 }
 
 #[no_mangle]
@@ -705,10 +727,10 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
 ) -> bool {
     let file_path: String = match env.get_string(&file_path) {
         Ok(s) => s.into(),
-        Err(_) => return false
+        Err(_) => return false,
     };
 
-    let cache = unsafe { &*(cache_ptr as *const Arc<DefaultFileStatisticsCache>) };
+    let cache = unsafe { &*(cache_ptr as *const CustomStatsCache) };
     let data_format = if file_path.to_lowercase().ends_with(".parquet") {
         "parquet"
     } else {
@@ -719,9 +741,9 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
     let statistics = Runtime::new()
         .expect("Failed to create Tokio Runtime")
         .block_on(async {
-            use parquet::file::reader::{FileReader, SerializedFileReader};
-            use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
             use datafusion::common::stats::ColumnStatistics;
+            use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+            use parquet::file::reader::{FileReader, SerializedFileReader};
             use std::fs::File;
 
             match File::open(&file_path) {
@@ -779,11 +801,11 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
                                 total_byte_size: Precision::Exact(total_byte_size as usize),
                                 column_statistics: column_stats,
                             })
-                        },
-                        Err(_) => Arc::new(Statistics::new_unknown(&arrow_schema::Schema::empty()))
+                        }
+                        Err(_) => Arc::new(Statistics::new_unknown(&arrow_schema::Schema::empty())),
                     }
-                },
-                Err(_) => Arc::new(Statistics::new_unknown(&arrow_schema::Schema::empty()))
+                }
+                Err(_) => Arc::new(Statistics::new_unknown(&arrow_schema::Schema::empty())),
             }
         });
 
@@ -795,7 +817,9 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
         }
     };
 
-    let result = cache.put(&path_obj, statistics);
+    let object_meta = create_object_meta_from_file(&file_path);
+
+    let result = cache.put_with_extra(&path_obj, statistics, &object_meta);
 
     if result.is_none() {
         println!("Failed to cache statistics for: {}", file_path);
@@ -818,7 +842,6 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
         Err(_) => return false,
     };
 
-
     let path_obj = match object_store::path::Path::from_url_path(&file_path) {
         Ok(path) => path,
         Err(_) => {
@@ -827,16 +850,9 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
         }
     };
 
-    let cache = unsafe { &mut *(cache_ptr as *mut Arc<DefaultFileStatisticsCache>) };
+    let cache = unsafe { &*(cache_ptr as *const CustomStatsCache) };
 
-    // Get mutable access through Arc
-    if let Some(cache_mut) = Arc::get_mut(cache) {
-        let _ = cache_mut.remove(&path_obj);
-        println!("Statistics cache removed for: {}", file_path);
-    } else {
-        // If we can't get mutable access (multiple references exist), we can't remove
-        println!("Cannot remove from statistics cache: multiple references exist for: {}", file_path);
-    }
+    let _ = cache.remove_internal(&path_obj);
     true
 }
 
@@ -852,8 +868,8 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
         Err(_) => return false,
     };
 
-    let cache = unsafe { &*(cache_ptr as *const Arc<DefaultFileStatisticsCache>) };
-   let path_obj = match object_store::path::Path::from_url_path(&file_path) {
+    let cache = unsafe { &*(cache_ptr as *const CustomStatsCache) };
+    let path_obj = match object_store::path::Path::from_url_path(&file_path) {
         Ok(path) => path,
         Err(_) => {
             println!("Failed to create path object from: {}", file_path);
@@ -865,11 +881,11 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
         Some(statistics) => {
             println!("Retrieved statistics for: {}", file_path);
             true
-        },
+        }
         None => {
             println!("No statistics found for: {}", file_path);
             false
-        },
+        }
     }
 }
 
@@ -930,15 +946,18 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
 //     result_array.as_raw()
 // }
 
-// #[no_mangle]
-// pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheGetSize(
-//     mut env: JNIEnv,
-//     _class: JClass,
-//     cache_ptr: jlong
-// ) -> usize {
-//     let cache = unsafe { &*(cache_ptr as *const DefaultFileStatisticsCache) };
-//     cache.memory_used()
-// }
+/// Get current memory usage from statistics cache
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheGetSize(
+    _env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+) -> jlong {
+    let cache = unsafe { &*(cache_ptr as *const CustomStatsCache) };
+
+    // Return actual memory consumed by the cache entries
+    cache.memory_consumed() as jlong
+}
 
 #[no_mangle]
 pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheContainsFile(
@@ -949,9 +968,9 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
 ) -> bool {
     let file_path: String = match env.get_string(&file_path) {
         Ok(s) => s.into(),
-        Err(_) => return false
+        Err(_) => return false,
     };
-    let cache = unsafe { &*(cache_ptr as *const Arc<DefaultFileStatisticsCache>) };
+    let cache = unsafe { &*(cache_ptr as *const CustomStatsCache) };
 
     let path_obj = match object_store::path::Path::from_url_path(&file_path) {
         Ok(path) => path,
@@ -960,34 +979,38 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
             return false;
         }
     };
-    cache.contains_key(&path_obj)
+    cache.inner().contains_key(&path_obj)
 }
 
-// #[no_mangle]
-// pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheUpdateSizeLimit(
-//      env: JNIEnv,
-//     _class: JClass,
-//     cache_ptr: jlong,
-//     new_size_limit: usize
-// ) -> bool {
-//     let cache = unsafe { &*(cache_ptr as *const DefaultFileStatisticsCache) };
-//     cache.update_cache_limit(new_size_limit);
-//     if cache.cache_limit() == new_size_limit {
-//         println!("Statistics cache size limit updated to: {}", new_size_limit);
-//         true
-//     } else {
-//         println!("Failed to update statistics cache size limit to: {}", new_size_limit);
-//         false
-//     }
-// }
+/// Update size limit for statistics cache
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheUpdateSizeLimit(
+    _env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+    new_size_limit: jlong,
+) -> bool {
+    let cache = unsafe { &mut *(cache_ptr as *mut CustomStatsCache) };
+
+    // Update size limit using the policy cache's functionality
+    match cache.update_size_limit(new_size_limit as usize) {
+        Ok(_) => {
+            println!("Statistics cache size limit updated to: {}", new_size_limit);
+        }
+        Err(_) => {
+            println!("Failed to update statistics cache size limit to: {}", new_size_limit);
+        }
+    }
+    true
+}
 
 #[no_mangle]
 pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheClear(
-     env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
-    cache_ptr: jlong
+    cache_ptr: jlong,
 ) {
-    let cache = unsafe { &*(cache_ptr as *const Arc<DefaultFileStatisticsCache>) };
+    let cache = unsafe { &*(cache_ptr as *const CustomStatsCache) };
     cache.clear();
     println!("Statistics cache cleared");
 }
