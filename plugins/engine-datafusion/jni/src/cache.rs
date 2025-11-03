@@ -13,6 +13,16 @@ fn handle_cache_error(env: &mut JNIEnv, operation: &str, error: &str) {
     let _ = env.throw_new("java/lang/RuntimeException", &msg);
 }
 
+/*
+DefaultFilesMetadataCache of datafusion is internally wrapped in a Mutex and requires mut access for operations like remove.
+Refer: https://github.com/apache/datafusion/blob/main/datafusion/execution/src/cache/cache_unit.rs#L312-L315
+https://github.com/apache/datafusion/blob/main/datafusion/execution/src/cache/cache_unit.rs#L402
+
+Having multiple references to Cache, trying to acquire a mutable reference for methods like remove
+would lead to failures.
+Hence explicit handling of mutable references is required for which MutexFileMetadataCache is introduced
+*/
+
 // Wrapper to make Mutex<DefaultFilesMetadataCache> implement FileMetadataCache
 pub struct MutexFileMetadataCache {
     pub inner: Mutex<DefaultFilesMetadataCache>,
@@ -128,7 +138,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_cacheGe
 ) -> jlong {
     let cache = unsafe { &*(cache_ptr as *const MutexFileMetadataCache) };
     let key = unsafe { &*(key_ptr as *const ObjectMeta) };
-    
+
     match cache.inner.lock() {
         Ok(cache_guard) => {
             match cache_guard.get(key) {
@@ -154,7 +164,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_cachePu
     let cache = unsafe { &*(cache_ptr as *const MutexFileMetadataCache) };
     let key = unsafe { &*(key_ptr as *const ObjectMeta) };
     let value = unsafe { Box::from_raw(value_ptr as *mut Arc<dyn datafusion::execution::cache::cache_manager::FileMetadata>) };
-    
+
     match cache.inner.lock() {
         Ok(mut cache_guard) => {
             match cache_guard.put(key, *value) {
@@ -178,7 +188,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_cacheRe
 ) -> jlong {
     let cache = unsafe { &mut *(cache_ptr as *mut MutexFileMetadataCache) };
     let key = unsafe { &*(key_ptr as *const ObjectMeta) };
-    
+
     match cache.remove(key) {
         Some(metadata) => Box::into_raw(Box::new(metadata)) as jlong,
         None => {
@@ -195,7 +205,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_cacheCl
     cache_ptr: jlong,
 ) {
     let cache = unsafe { &*(cache_ptr as *const MutexFileMetadataCache) };
-    
+
     match cache.inner.lock() {
         Ok(mut cache_guard) => cache_guard.clear(),
         Err(e) => handle_cache_error(&mut env, "clear", &e.to_string()),
