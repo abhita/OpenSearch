@@ -13,12 +13,15 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.common.settings.ClusterSettings;
 
 import static org.opensearch.datafusion.DataFusionQueryJNI.initCacheManagerConfig;
 
 
 public class CacheManager {
+    private static final Logger logger = LogManager.getLogger(CacheManager.class);
 
     private Map<CacheType, CacheAccessor> caches;
     private long cacheManagerPtr;
@@ -74,8 +77,6 @@ public class CacheManager {
                 allSuccessful &= cache.remove(filename);
             }
         }
-
-
         return allSuccessful;
     }
 

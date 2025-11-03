@@ -77,9 +77,7 @@ public class DataFusionQueryJNI {
      * Create a new global runtime environment
      * @return runtime env pointer for subsequent operations
      */
-    public static native long createGlobalRuntime();
-
-    public static native long createGlobalRuntimev1(long cacheManagerPtr);
+    public static native long createGlobalRuntime(long cacheManagerPtr);
 
     public static native long createTokioRuntime();
 
@@ -115,9 +113,7 @@ public class DataFusionQueryJNI {
      * @param substraitPlan the serialized Substrait query plan
      * @return stream pointer for result iteration
      */
-    public static native long executeSubstraitQuery(long cachePtr, String tableName, byte[] substraitPlan, long runtimePtr);
-
-    public static native long executeSubstraitQuery(long cachePtr, byte[] substraitPlan, long tokioRuntimePtr, long runtimePtr);
+    public static native long executeSubstraitQuery(long cachePtr, String tableName, byte[] substraitPlan, long runtimeEnvPtr ,long tokioRuntimePtr);
 
     public static native long createDatafusionReader(String path, String[] files);
 

@@ -35,7 +35,7 @@ public class DatafusionReader implements Closeable {
      * The cache pointer.
      */
     public long cachePtr;
-    private AtomicInteger refCount = new AtomicInteger(0);
+    private final AtomicInteger refCount = new AtomicInteger(1);
 
     /**
      * Constructor
@@ -56,7 +56,6 @@ public class DatafusionReader implements Closeable {
         System.out.println("Directory path: " + directoryPath);
 
         this.cachePtr = DataFusionQueryJNI.createDatafusionReader(directoryPath, fileNames);
-        incRef();
     }
 
     /**
@@ -71,7 +70,23 @@ public class DatafusionReader implements Closeable {
      * Increments the reference count.
      */
     public void incRef() {
-        refCount.getAndIncrement();
+        if (!tryIncRef()) {
+            throw new IllegalStateException("DatafusionReader is already closed");
+        }
+    }
+    
+    /**
+     * Tries to increment the reference count.
+     * @return true if successful, false if already closed
+     */
+    public boolean tryIncRef() {
+        int count;
+        while ((count = refCount.get()) > 0) {
+            if (refCount.compareAndSet(count, count + 1)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -79,15 +94,12 @@ public class DatafusionReader implements Closeable {
      * @throws IOException if an I/O error occurs
      */
     public void decRef() throws IOException {
-        if(refCount.get() == 0) {
-            throw new IllegalStateException("Listing table has been already closed");
+        int count = refCount.decrementAndGet();
+        if (count == 0) {
+            close();
+        } else if (count < 0) {
+            throw new IllegalStateException("Too many decRef calls on DatafusionReader");
         }
-
-        int currRefCount = refCount.decrementAndGet();
-        if(currRefCount == 0) {
-            this.close();
-        }
-
     }
 
     @Override

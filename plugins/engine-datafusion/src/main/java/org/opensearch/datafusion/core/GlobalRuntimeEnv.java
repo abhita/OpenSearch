@@ -13,7 +13,6 @@ import org.opensearch.datafusion.search.cache.CacheManager;
 
 import static org.opensearch.datafusion.DataFusionQueryJNI.closeGlobalRuntime;
 import static org.opensearch.datafusion.DataFusionQueryJNI.createGlobalRuntime;
-import static org.opensearch.datafusion.DataFusionQueryJNI.createGlobalRuntimev1;
 import static org.opensearch.datafusion.DataFusionQueryJNI.createTokioRuntime;
 
 /**
@@ -27,18 +26,9 @@ public class GlobalRuntimeEnv implements AutoCloseable {
     private CacheManager cacheManager;
 
 
-    /**
-     * Creates a new global runtime environment.
-     */
-    public GlobalRuntimeEnv() {
-        this.ptr = createGlobalRuntime();
-        this.tokio_runtime_ptr = createTokioRuntime();
-        this.cacheManager = null;
-    }
-
     public GlobalRuntimeEnv(ClusterSettings clusterSettings) {
         this.cacheManager = CacheManager.fromConfig(clusterSettings);
-        this.ptr = createGlobalRuntimev1(cacheManager.getCacheManagerPtr());
+        this.ptr = createGlobalRuntime(cacheManager.getCacheManagerPtr());
         this.tokio_runtime_ptr = createTokioRuntime();
     }
 

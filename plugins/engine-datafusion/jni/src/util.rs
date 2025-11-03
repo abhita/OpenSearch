@@ -162,7 +162,7 @@ pub fn throw_exception(env: &mut JNIEnv, message: &str) {
 }
 
 pub fn create_object_meta_from_filenames(base_path: &str, filenames: Vec<String>) -> Vec<ObjectMeta> {
-    filenames.into_iter().map(|filename| {
+    filenames.into_iter().filter_map(|filename| {
         let filename = filename.as_str();
         // Handle both full paths and relative filenames
         let full_path = if filename.starts_with('/') || filename.contains(base_path) {
@@ -171,7 +171,18 @@ pub fn create_object_meta_from_filenames(base_path: &str, filenames: Vec<String>
         } else {
             // Just a filename, needs base_path
             format!("{}/{}", base_path.trim_end_matches('/'), filename)
-        };        create_object_meta_from_file(&full_path)
+        };
+        
+        // Check if file exists and has content
+        match fs::metadata(&full_path) {
+            Ok(metadata) if metadata.len() > 0 => {
+                Some(create_object_meta_from_file(&full_path))
+            }
+            _ => {
+                eprintln!("Skipping empty or non-existent file: {}", full_path);
+                None
+            }
+        }
     }).collect()
 }
 

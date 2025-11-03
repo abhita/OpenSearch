@@ -23,14 +23,6 @@ mod listing_table;
 mod cache;
 
 use datafusion::execution::context::SessionContext;
-
-use crate::util::{create_object_meta_from_filenames, parse_string_arr, set_object_result_error, set_object_result_ok};
-use datafusion::datasource::file_format::csv::CsvFormat;
-use datafusion::datasource::listing::{ListingTableUrl};
-use datafusion::execution::cache::cache_manager::CacheManagerConfig;
-use datafusion::execution::cache::cache_unit::DefaultListFilesCache;
-use datafusion::execution::cache::CacheAccessor;
-use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::SessionConfig;
 use datafusion::DATAFUSION_VERSION;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -44,7 +36,7 @@ use prost::Message;
 use tokio::runtime::Runtime;
 use crate::listing_table::{ListingOptions, ListingTable, ListingTableConfig};
 use crate::row_id_optimizer::FilterRowIdOptimizer;
-use crate::metadata_cache::{MutexFileMetadataCache};
+use crate::cache::{MutexFileMetadataCache};
 use crate::util::{construct_file_metadata, create_object_meta_from_file, create_object_meta_from_filenames, parse_string_arr, set_object_result_error, set_object_result_ok};
 
 use datafusion::datasource::file_format::csv::CsvFormat;
@@ -55,6 +47,28 @@ use datafusion::datasource::physical_plan::FileMeta;
 use datafusion::execution::cache::cache_unit::{DefaultFilesMetadataCache, DefaultListFilesCache};
 use datafusion::execution::cache::CacheAccessor;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+
+// Exception handling macro for JNI
+macro_rules! jni_try {
+    ($env:expr, $result:expr) => {
+        match $result {
+            Ok(val) => val,
+            Err(e) => {
+                let _ = $env.throw_new("java/lang/RuntimeException", &e.to_string());
+                return -1;
+            }
+        }
+    };
+    ($env:expr, $result:expr, $default:expr) => {
+        match $result {
+            Ok(val) => val,
+            Err(e) => {
+                let _ = $env.throw_new("java/lang/RuntimeException", &e.to_string());
+                return $default;
+            }
+        }
+    };
+}
 
 /// Create a new DataFusion session context
 #[no_mangle]
@@ -99,59 +113,26 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_getVers
 
 #[no_mangle]
 pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createTokioRuntime(
-    _env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
 ) -> jlong {
-    let rt = Runtime::new().unwrap();
-    let ctx = Box::into_raw(Box::new(rt)) as jlong;
-    ctx
+    let rt = jni_try!(env, Runtime::new());
+    Box::into_raw(Box::new(rt)) as jlong
 }
 
 #[no_mangle]
 pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createGlobalRuntime(
-    _env: JNIEnv,
-    _class: JClass,
-) -> jlong {
-    let runtime_env = RuntimeEnvBuilder::default().build().unwrap();
-    /**
-    // We can copy global runtime to local runtime - file statistics cache, and most of the things
-    // will be shared across session contexts. But list files cache will be specific to session
-    // context
-
-    let fsCache = runtimeEnv.clone().cache_manager.get_file_statistic_cache().unwrap();
-    let localCacheManagerConfig = CacheManagerConfig::default().with_files_statistics_cache(Option::from(fsCache));
-    let localCacheManager = CacheManager::try_new(&localCacheManagerConfig);
-    let localRuntimeEnv = RuntimeEnvBuilder::new()
-        .with_cache_manager(localCacheManagerConfig)
-        .with_disk_manager(DiskManagerConfig::new_existing(runtimeEnv.disk_manager))
-        .with_memory_pool(runtimeEnv.memory_pool)
-        .with_object_store_registry(runtimeEnv.object_store_registry)
-        .build();
-    let config = SessionConfig::new().with_repartition_aggregations(true);
-    let context = SessionContext::new_with_config(config);
-    **/
-
-    let ctx = Box::into_raw(Box::new(runtime_env)) as jlong;
-    ctx
-}
-
-#[no_mangle]
-pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createGlobalRuntimev1(
-    _env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     cache_config_ptr: jlong,
 ) -> jlong {
-        // Take ownership of the CacheManagerConfig
     let cache_manager_config = unsafe { Box::from_raw(cache_config_ptr as *mut CacheManagerConfig) };
 
-    // Create RuntimeEnv with the configured cache manager
-    let runtime_env = RuntimeEnvBuilder::default()
+    let runtime_env = jni_try!(env, RuntimeEnvBuilder::default()
         .with_cache_manager(*cache_manager_config)
-        .build()
-        .unwrap();
+        .build());
 
-    let ptr =Box::into_raw(Box::new(runtime_env)) as jlong;
-    ptr
+    Box::into_raw(Box::new(runtime_env)) as jlong
 }
 
 #[no_mangle]
@@ -184,12 +165,11 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createD
     table_path: JString,
     files: JObjectArray
 ) -> jlong {
-
-    let table_path: String = env.get_string(&table_path).expect("Couldn't get java string!").into();
-    let files: Vec<String> = parse_string_arr(&mut env, files).expect("Expected list of files");
+    let table_path: String = jni_try!(env, env.get_string(&table_path).map(|s| s.into()));
+    let files: Vec<String> = jni_try!(env, parse_string_arr(&mut env, files));
     let files_meta = create_object_meta_from_filenames(&table_path, files);
 
-    let table_path = ListingTableUrl::parse(table_path).unwrap();
+    let table_path = jni_try!(env, ListingTableUrl::parse(table_path));
     let shard_view = ShardView::new(table_path, files_meta);
     Box::into_raw(Box::new(shard_view)) as jlong
 }
@@ -225,122 +205,123 @@ impl ShardView {
         self.files_meta.clone()
     }
 }
+//
+// #[no_mangle]
+// pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_executeSubstraitQuery(
+//     mut env: JNIEnv,
+//     _class: JClass,
+//     shard_view_ptr: jlong,
+//     substrait_bytes: jbyteArray,
+//     tokio_runtime_env_ptr: jlong,
+//     // callback: JObject,
+// ) -> jlong {
+//     let shard_view = unsafe { &*(shard_view_ptr as *const ShardView) };
+//     let runtime_ptr = unsafe { &*(tokio_runtime_env_ptr as *const Runtime)};
+//
+//     let table_path = shard_view.table_path();
+//     let files_meta = shard_view.files_meta();
+//
+//     println!("Table path: {}", table_path);
+//     println!("Files: {:?}", files_meta);
+//
+//     let list_file_cache = Arc::new(DefaultListFilesCache::default());
+//     list_file_cache.put(table_path.prefix(), files_meta);
+//
+//     let runtime_env = RuntimeEnvBuilder::new()
+//         .with_cache_manager(CacheManagerConfig::default()
+//                                 .with_list_files_cache(Some(list_file_cache.clone()))
+//         ).build().unwrap();
+//
+//     // TODO: get config from CSV DataFormat
+//     let mut config = SessionConfig::new();
+//     // config.options_mut().execution.parquet.pushdown_filters = true;
+//
+//     let state = datafusion::execution::SessionStateBuilder::new()
+//         .with_config(config)
+//         .with_runtime_env(Arc::from(runtime_env))
+//         .with_default_features()
+//         // .with_optimizer_rule(Arc::new(OptimizeRowId))
+//         // .with_physical_optimizer_rule(Arc::new(FilterRowIdOptimizer)) // TODO: enable only for query phase
+//         .build();
+//
+//     let ctx = SessionContext::new_with_state(state);
+//
+//     // Create default parquet options
+//     let file_format = ParquetFormat::new();
+//     let listing_options = ListingOptions::new(Arc::new(file_format))
+//         .with_file_extension(".parquet"); // TODO: take this as parameter
+//         // .with_table_partition_cols(vec![("row_base".to_string(), DataType::Int32)]); // TODO: enable only for query phase
+//
+//     // Ideally the executor will give this
+//     runtime_ptr.block_on(async {
+//         let resolved_schema = listing_options
+//             .infer_schema(&ctx.state(), &table_path.clone())
+//             .await.unwrap();
+//
+//
+//         let config = ListingTableConfig::new(table_path.clone())
+//             .with_listing_options(listing_options)
+//             .with_schema(resolved_schema);
+//
+//         // Create a new TableProvider
+//         let provider = Arc::new(ListingTable::try_new(config).unwrap());
+//         let shard_id = table_path.prefix().filename().expect("error in fetching Path");
+//         ctx.register_table("index-7", provider)
+//             .expect("Failed to attach the Table");
+//
+//     });
+//
+//     // TODO : how to close ctx ?
+//     // Convert Java byte array to Rust Vec<u8>
+//     let plan_bytes_obj = unsafe { JByteArray::from_raw(substrait_bytes) };
+//     let plan_bytes_vec = match env.convert_byte_array(plan_bytes_obj) {
+//         Ok(bytes) => bytes,
+//         Err(e) => {
+//             let error_msg = format!("Failed to convert plan bytes: {}", e);
+//             env.throw_new("java/lang/Exception", error_msg);
+//             return 0;
+//         }
+//     };
+//
+//     let substrait_plan = match Plan::decode(plan_bytes_vec.as_slice()) {
+//         Ok(plan) => {
+//             println!("SUBSTRAIT rust: Decoding is successful, Plan has {} relations", plan.relations.len());
+//             plan
+//         },
+//         Err(e) => {
+//             return 0;
+//         }
+//     };
+//
+//     //let runtime = unsafe { &mut *(runtime_ptr as *mut Runtime) };
+//     runtime_ptr.block_on(async {
+//
+//         let logical_plan = match from_substrait_plan(&ctx.state(), &substrait_plan).await {
+//             Ok(plan) => {
+//                 println!("SUBSTRAIT Rust: LogicalPlan: {:?}", plan);
+//                 plan
+//             },
+//             Err(e) => {
+//                 println!("SUBSTRAIT Rust: Failed to convert Substrait plan: {}", e);
+//                 return 0;
+//             }
+//         };
+//
+//         let dataframe = ctx.execute_logical_plan(logical_plan).await.unwrap();
+//         let stream = dataframe.execute_stream().await.unwrap();
+//         let stream_ptr = Box::into_raw(Box::new(stream)) as jlong;
+//
+//         stream_ptr
+//
+//     })
+// }
 
 #[no_mangle]
 pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_executeSubstraitQuery(
     mut env: JNIEnv,
     _class: JClass,
     shard_view_ptr: jlong,
-    substrait_bytes: jbyteArray,
-    tokio_runtime_env_ptr: jlong,
-    // callback: JObject,
-) -> jlong {
-    let shard_view = unsafe { &*(shard_view_ptr as *const ShardView) };
-    let runtime_ptr = unsafe { &*(tokio_runtime_env_ptr as *const Runtime)};
-
-    let table_path = shard_view.table_path();
-    let files_meta = shard_view.files_meta();
-
-    println!("Table path: {}", table_path);
-    println!("Files: {:?}", files_meta);
-
-    let list_file_cache = Arc::new(DefaultListFilesCache::default());
-    list_file_cache.put(table_path.prefix(), files_meta);
-
-    let runtime_env = RuntimeEnvBuilder::new()
-        .with_cache_manager(CacheManagerConfig::default()
-                                .with_list_files_cache(Some(list_file_cache.clone()))
-        ).build().unwrap();
-
-    // TODO: get config from CSV DataFormat
-    let mut config = SessionConfig::new();
-    // config.options_mut().execution.parquet.pushdown_filters = true;
-
-    let state = datafusion::execution::SessionStateBuilder::new()
-        .with_config(config)
-        .with_runtime_env(Arc::from(runtime_env))
-        .with_default_features()
-        // .with_optimizer_rule(Arc::new(OptimizeRowId))
-        // .with_physical_optimizer_rule(Arc::new(FilterRowIdOptimizer)) // TODO: enable only for query phase
-        .build();
-
-    let ctx = SessionContext::new_with_state(state);
-
-    // Create default parquet options
-    let file_format = ParquetFormat::new();
-    let listing_options = ListingOptions::new(Arc::new(file_format))
-        .with_file_extension(".parquet"); // TODO: take this as parameter
-        // .with_table_partition_cols(vec![("row_base".to_string(), DataType::Int32)]); // TODO: enable only for query phase
-
-    // Ideally the executor will give this
-    runtime_ptr.block_on(async {
-        let resolved_schema = listing_options
-            .infer_schema(&ctx.state(), &table_path.clone())
-            .await.unwrap();
-
-
-        let config = ListingTableConfig::new(table_path.clone())
-            .with_listing_options(listing_options)
-            .with_schema(resolved_schema);
-
-        // Create a new TableProvider
-        let provider = Arc::new(ListingTable::try_new(config).unwrap());
-        let shard_id = table_path.prefix().filename().expect("error in fetching Path");
-        ctx.register_table("index-7", provider)
-            .expect("Failed to attach the Table");
-
-    });
-
-    // TODO : how to close ctx ?
-    // Convert Java byte array to Rust Vec<u8>
-    let plan_bytes_obj = unsafe { JByteArray::from_raw(substrait_bytes) };
-    let plan_bytes_vec = match env.convert_byte_array(plan_bytes_obj) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            let error_msg = format!("Failed to convert plan bytes: {}", e);
-            env.throw_new("java/lang/Exception", error_msg);
-            return 0;
-        }
-    };
-
-    let substrait_plan = match Plan::decode(plan_bytes_vec.as_slice()) {
-        Ok(plan) => {
-            println!("SUBSTRAIT rust: Decoding is successful, Plan has {} relations", plan.relations.len());
-            plan
-        },
-        Err(e) => {
-            return 0;
-        }
-    };
-
-    //let runtime = unsafe { &mut *(runtime_ptr as *mut Runtime) };
-    runtime_ptr.block_on(async {
-
-        let logical_plan = match from_substrait_plan(&ctx.state(), &substrait_plan).await {
-            Ok(plan) => {
-                println!("SUBSTRAIT Rust: LogicalPlan: {:?}", plan);
-                plan
-            },
-            Err(e) => {
-                println!("SUBSTRAIT Rust: Failed to convert Substrait plan: {}", e);
-                return 0;
-            }
-        };
-
-        let dataframe = ctx.execute_logical_plan(logical_plan).await.unwrap();
-        let stream = dataframe.execute_stream().await.unwrap();
-        let stream_ptr = Box::into_raw(Box::new(stream)) as jlong;
-
-        stream_ptr
-
-    })
-}
-
-#[no_mangle]
-pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_executeSubstraitQueryv1(
-    mut env: JNIEnv,
-    _class: JClass,
-    shard_view_ptr: jlong,
+    table_name: JString,
     substrait_bytes: jbyteArray,
     tokio_runtime_env_ptr: jlong,
     global_runtime_env_ptr: jlong,

@@ -9,6 +9,7 @@
 package org.opensearch.datafusion.search;
 
 import org.apache.lucene.store.AlreadyClosedException;
+import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.datafusion.DataFusionQueryJNI;
 import org.opensearch.datafusion.DataFusionService;
 import org.opensearch.datafusion.core.DefaultRecordBatchStream;
@@ -28,12 +29,14 @@ public class DatafusionSearcher implements EngineSearcher<DatafusionQuery, Recor
     private Long tokioRuntimePtr;
     private Long globalRuntimeEnvId;
     private Closeable closeable;
+    private boolean readerReleased = false;
 
     public DatafusionSearcher(String source, DatafusionReader reader, Long tokioRuntimePtr, Long globalRuntimeEnvId, Closeable close) {
         this.source = source;
         this.reader = reader;
         this.tokioRuntimePtr = tokioRuntimePtr;
         this.globalRuntimeEnvId = globalRuntimeEnvId;
+        this.closeable = close;
     }
 
     @Override
@@ -45,7 +48,7 @@ public class DatafusionSearcher implements EngineSearcher<DatafusionQuery, Recor
     public void search(DatafusionQuery datafusionQuery, List<SearchResultsCollector<RecordBatchStream>> collectors) throws IOException {
         // TODO : call search here to native
         // TODO : change RunTimePtr
-        long nativeStreamPtr = DataFusionQueryJNI.executeSubstraitQuery(reader.getCachePtr(), datafusionQuery.toString(), datafusionQuery.getSubstraitBytes(), tokioRuntimePtr, globalRuntimeEnvId);
+        long nativeStreamPtr = DataFusionQueryJNI.executeSubstraitQuery(reader.getCachePtr(), datafusionQuery.toString(), datafusionQuery.getSubstraitBytes(), globalRuntimeEnvId, tokioRuntimePtr);
         RecordBatchStream stream = new DefaultRecordBatchStream(nativeStreamPtr);
         while(stream.hasNext()) {
             for(SearchResultsCollector<RecordBatchStream> collector : collectors) {
@@ -54,14 +57,14 @@ public class DatafusionSearcher implements EngineSearcher<DatafusionQuery, Recor
         }
     }
 
-    @Override
-    public long search(DatafusionQuery datafusionQuery, Long contextPtr) {
-        return DataFusionQueryJNI.executeSubstraitQuery(reader.getCachePtr(), datafusionQuery.getIndexName(), datafusionQuery.getSubstraitBytes(), contextPtr);
-    }
+//    @Override
+//    public long search(DatafusionQuery datafusionQuery, Long contextPtr) {
+//        return DataFusionQueryJNI.executeSubstraitQuery(reader.getCachePtr(), datafusionQuery.getIndexName(), datafusionQuery.getSubstraitBytes(), contextPtr);
+//    }
 
     @Override
-    public long search(DatafusionQuery datafusionQuery, Long contextPtr, Long globalRuntimeEnvId) {
-        return DataFusionQueryJNI.executeSubstraitQueryv1(reader.getCachePtr(), datafusionQuery.getSubstraitBytes(), contextPtr, globalRuntimeEnvId);
+    public long search(DatafusionQuery datafusionQuery, Long contextPtr, Long globalRuntimeEnvId, Long tokioRuntimePtr) {
+        return DataFusionQueryJNI.executeSubstraitQuery(reader.getCachePtr(), datafusionQuery.getIndexName(), datafusionQuery.getSubstraitBytes(), globalRuntimeEnvId, tokioRuntimePtr);
     }
 
     public DatafusionReader getReader() {
@@ -71,15 +74,13 @@ public class DatafusionSearcher implements EngineSearcher<DatafusionQuery, Recor
     @Override
     public void close() {
         try {
-            if (closeable != null) {
-                closeable.close();
-            }
+            // Use IOUtils.close for exception safety - only close other resources
+            // Reader reference is managed by the ReaderManager
+            IOUtils.close(closeable);
         } catch (IOException e) {
-            throw new UncheckedIOException("failed to close", e);
+            throw new UncheckedIOException("failed to close searcher", e);
         } catch (AlreadyClosedException e) {
-            // This means there's a bug somewhere: don't suppress it
             throw new AssertionError(e);
         }
-
     }
 }

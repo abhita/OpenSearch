@@ -109,13 +109,14 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
                 protected DatafusionSearcher acquireSearcherInternal(String source) {
                     return new DatafusionSearcher(source, reader, datafusionService.getTokioRuntimePointer(),
                         datafusionService.getRuntimePointer(), () -> {});
+
                 }
 
                 @Override
                 protected void doClose() {
                     try {
                         cacheManager.removeFilesByDirectory(reader.directoryPath);
-                        reader.decRef();
+                        datafusionReaderManager.release(reader);
                     } catch (IOException e) {
                         throw new UncheckedIOException(e);
                     }
@@ -153,7 +154,8 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
                 () -> Releasables.close(searcher, searcherSupplier)
             );
         } finally {
-            Releasables.close(releasable);
+            logger.info("FINSLLY");
+          //  Releasables.close(releasable);
         }
     }
 

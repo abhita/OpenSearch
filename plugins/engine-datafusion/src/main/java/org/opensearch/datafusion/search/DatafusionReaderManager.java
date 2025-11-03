@@ -51,11 +51,15 @@ public class DatafusionReaderManager implements EngineReaderManager<DatafusionRe
 
     @Override
     public DatafusionReader acquire() throws IOException {
-        if (current == null) {
+        DatafusionReader reader = current;
+        if (reader == null) {
             throw new RuntimeException("Invalid state for datafusion reader");
         }
-        current.incRef();
-        return current;
+        if (!reader.tryIncRef()) {
+            // Reader was closed between getting reference and incRef, retry
+            throw new IOException("DatafusionReader was closed during acquire");
+        }
+        return reader;
     }
 
     @Override
@@ -75,14 +79,20 @@ public class DatafusionReaderManager implements EngineReaderManager<DatafusionRe
         if (didRefresh && catalogSnapshot != null) {
             DatafusionReader old = this.current;
             Collection<WriterFileSet> newFiles = catalogSnapshot.getSearchableFiles(dataFormat);
-            if(old !=null) {
-                release(old);
+            
+            // Create new reader first
+            DatafusionReader newReader = new DatafusionReader(this.path, newFiles);
+            
+            // Atomically swap current reader
+            this.current = newReader;
+            
+            // Process file changes and release old reader
+            if (old != null) {
                 processFileChanges(old.files, newFiles);
+                release(old);
             } else {
                 processFileChanges(List.of(), newFiles);
             }
-            this.current = new DatafusionReader(this.path, newFiles);
-            this.current.incRef();
         }
     }
 

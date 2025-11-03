@@ -11,10 +11,13 @@ package org.opensearch.datafusion;
 import java.io.File;
 import java.net.URL;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.junit.Before;
+import org.junit.Test;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.opensearch.common.settings.ClusterSettings;
@@ -27,6 +30,8 @@ import org.opensearch.datafusion.search.cache.CacheType;
 import org.opensearch.env.Environment;
 import org.opensearch.test.OpenSearchTestCase;
 
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.opensearch.common.settings.ClusterSettings.BUILT_IN_CLUSTER_SETTINGS;
 import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_ENABLED;
@@ -38,6 +43,11 @@ public class DataFusionCacheManagerTests extends OpenSearchTestCase {
 
     @Mock
     private Environment mockEnvironment;
+
+    @Mock
+    private CacheAccessor mockCache;
+
+    private CacheManager cacheManagerv1;
 
     @Before
     public void setup() {
@@ -190,11 +200,65 @@ public class DataFusionCacheManagerTests extends OpenSearchTestCase {
         assertTrue(totalLimit > 0);
     }
 
+    public void testRemoveFilesWithCacheAccessorFailure() {
+        setUpMockCacheAccessor();
+        when(mockCache.remove("file1")).thenReturn(false); // CacheAccessor handles exception internally
+        when(mockCache.remove("file2")).thenReturn(true);
+
+        boolean result = cacheManagerv1.removeFiles(List.of("file1", "file2"));
+
+        assertFalse(result);
+        verify(mockCache).remove("file1");
+        verify(mockCache).remove("file2");
+    }
+
+    public void testAddToCacheWithCacheAccessorFailure() {
+        setUpMockCacheAccessor();
+        when(mockCache.put("file1")).thenReturn(false); // CacheAccessor handles exception internally
+        when(mockCache.put("file2")).thenReturn(true);
+
+        boolean result = cacheManagerv1.addToCache(List.of("file1", "file2"));
+
+        assertFalse(result);
+        verify(mockCache).put("file1");
+        verify(mockCache).put("file2");
+    }
+
+    public void testGetTotalUsedBytesWithCacheAccessorFailure() {
+        setUpMockCacheAccessor();
+        when(mockCache.getMemoryConsumed()).thenReturn(0L); // CacheAccessor handles exception internally
+
+        long result = cacheManagerv1.getTotalUsedBytes();
+
+        assertEquals(0L, result);
+        verify(mockCache).getMemoryConsumed();
+    }
+
+    public void testWithinCacheLimitWithCacheAccessorFailure() {
+        setUpMockCacheAccessor();
+        when(mockCache.getMemoryConsumed()).thenReturn(0L); // CacheAccessor handles exception internally
+
+        boolean result = cacheManagerv1.withinCacheLimit(CacheType.METADATA);
+
+        assertTrue(result); // 0L < 1000L
+        verify(mockCache).getMemoryConsumed();
+    }
+
     private File getResourceFile(String fileName) {
         URL resourceUrl = getClass().getClassLoader().getResource(fileName);
         if (resourceUrl == null) {
             throw new IllegalArgumentException("Resource not found: " + fileName);
         }
         return new File(resourceUrl.getPath());
+    }
+
+    private void setUpMockCacheAccessor() {
+        MockitoAnnotations.openMocks(this);
+        when(mockCache.getName()).thenReturn("TestCache");
+        when(mockCache.getConfiguredSizeLimit()).thenReturn(1000L);
+
+        Map<CacheType, CacheAccessor> cacheMap = new HashMap<>();
+        cacheMap.put(CacheType.METADATA, mockCache);
+        cacheManagerv1 = new CacheManager(123L, cacheMap);
     }
 }
