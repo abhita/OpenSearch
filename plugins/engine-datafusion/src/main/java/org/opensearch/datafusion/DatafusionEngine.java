@@ -154,8 +154,7 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
                 () -> Releasables.close(searcher, searcherSupplier)
             );
         } finally {
-            logger.info("FINSLLY");
-          //  Releasables.close(releasable);
+            Releasables.close(releasable);
         }
     }
 
@@ -179,7 +178,8 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
         Map<String, Object[]> finalRes = new HashMap<>();
         try {
             DatafusionSearcher datafusionSearcher = context.getEngineSearcher();
-            long streamPointer = datafusionSearcher.search(context.getDatafusionQuery());
+            long streamPointer = datafusionSearcher.search(context.getDatafusionQuery(),
+                datafusionService.getRuntimePointer(),datafusionService.getTokioRuntimePointer());
             RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
             RecordBatchStream stream = new RecordBatchStream(streamPointer, datafusionService.getTokioRuntimePointer() , allocator);
 

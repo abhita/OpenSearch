@@ -10,7 +10,13 @@ use object_store::ObjectMeta;
 // Helper function to handle cache errors
 fn handle_cache_error(env: &mut JNIEnv, operation: &str, error: &str) {
     let msg = format!("Cache {} failed: {}", operation, error);
+    eprintln!("[CACHE ERROR] {}", msg);
     let _ = env.throw_new("java/lang/RuntimeException", &msg);
+}
+
+// Helper function to log cache operations
+fn log_cache_error(operation: &str, error: &str) {
+    eprintln!("[CACHE ERROR] {} operation failed: {}", operation, error);
 }
 
 /*
@@ -43,62 +49,87 @@ impl CacheAccessor<ObjectMeta, Arc<dyn datafusion::execution::cache::cache_manag
     fn get(&self, k: &ObjectMeta) -> Option<Arc<dyn datafusion::execution::cache::cache_manager::FileMetadata>> {
         match self.inner.lock() {
             Ok(cache) => cache.get(k),
-            Err(_) => None, // Return None on lock failure
+            Err(e) => {
+                log_cache_error("get", &e.to_string());
+                None
+            }
         }
     }
 
     fn get_with_extra(&self, k: &ObjectMeta, extra: &Self::Extra) -> Option<Arc<dyn datafusion::execution::cache::cache_manager::FileMetadata>> {
         match self.inner.lock() {
             Ok(cache) => cache.get_with_extra(k, extra),
-            Err(_) => None,
+            Err(e) => {
+                log_cache_error("get_with_extra", &e.to_string());
+                None
+            }
         }
     }
 
     fn put(&self, k: &ObjectMeta, v: Arc<dyn datafusion::execution::cache::cache_manager::FileMetadata>) -> Option<Arc<dyn datafusion::execution::cache::cache_manager::FileMetadata>> {
         match self.inner.lock() {
             Ok(mut cache) => cache.put(k, v),
-            Err(_) => None,
+            Err(e) => {
+                log_cache_error("put", &e.to_string());
+                None
+            }
         }
     }
 
     fn put_with_extra(&self, k: &ObjectMeta, v: Arc<dyn datafusion::execution::cache::cache_manager::FileMetadata>, e: &Self::Extra) -> Option<Arc<dyn datafusion::execution::cache::cache_manager::FileMetadata>> {
         match self.inner.lock() {
             Ok(mut cache) => cache.put_with_extra(k, v, e),
-            Err(_) => None,
+            Err(err) => {
+                log_cache_error("put_with_extra", &err.to_string());
+                None
+            }
         }
     }
 
     fn remove(&mut self, k: &ObjectMeta) -> Option<Arc<dyn datafusion::execution::cache::cache_manager::FileMetadata>> {
         match self.inner.lock() {
             Ok(mut cache) => cache.remove(k),
-            Err(_) => None,
+            Err(e) => {
+                log_cache_error("remove", &e.to_string());
+                None
+            }
         }
     }
 
     fn contains_key(&self, k: &ObjectMeta) -> bool {
         match self.inner.lock() {
             Ok(cache) => cache.contains_key(k),
-            Err(_) => false,
+            Err(e) => {
+                log_cache_error("contains_key", &e.to_string());
+                false
+            }
         }
     }
 
     fn len(&self) -> usize {
         match self.inner.lock() {
             Ok(cache) => cache.len(),
-            Err(_) => 0,
+            Err(e) => {
+                log_cache_error("len", &e.to_string());
+                0
+            }
         }
     }
 
     fn clear(&self) {
-        if let Ok(mut cache) = self.inner.lock() {
-            cache.clear();
+        match self.inner.lock() {
+            Ok(mut cache) => cache.clear(),
+            Err(e) => log_cache_error("clear", &e.to_string()),
         }
     }
 
     fn name(&self) -> String {
         match self.inner.lock() {
             Ok(cache) => cache.name(),
-            Err(_) => "cache_error".to_string(),
+            Err(e) => {
+                log_cache_error("name", &e.to_string());
+                "cache_error".to_string()
+            }
         }
     }
 }
@@ -107,20 +138,27 @@ impl FileMetadataCache for MutexFileMetadataCache {
     fn cache_limit(&self) -> usize {
         match self.inner.lock() {
             Ok(cache) => cache.cache_limit(),
-            Err(_) => 0,
+            Err(e) => {
+                log_cache_error("cache_limit", &e.to_string());
+                0
+            }
         }
     }
 
     fn update_cache_limit(&self, limit: usize) {
-        if let Ok(mut cache) = self.inner.lock() {
-            cache.update_cache_limit(limit);
+        match self.inner.lock() {
+            Ok(mut cache) => cache.update_cache_limit(limit),
+            Err(e) => log_cache_error("update_cache_limit", &e.to_string()),
         }
     }
 
     fn list_entries(&self) -> std::collections::HashMap<object_store::path::Path, datafusion::execution::cache::cache_manager::FileMetadataCacheEntry> {
         match self.inner.lock() {
             Ok(cache) => cache.list_entries(),
-            Err(_) => std::collections::HashMap::new(),
+            Err(e) => {
+                log_cache_error("list_entries", &e.to_string());
+                std::collections::HashMap::new()
+            }
         }
     }
 }

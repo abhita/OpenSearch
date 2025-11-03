@@ -323,8 +323,8 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_execute
     shard_view_ptr: jlong,
     table_name: JString,
     substrait_bytes: jbyteArray,
-    tokio_runtime_env_ptr: jlong,
     global_runtime_env_ptr: jlong,
+    tokio_runtime_env_ptr: jlong,
     // callback: JObject,
 ) -> jlong {
     let overall = Instant::now();
@@ -622,15 +622,20 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_metadat
                 .expect("Failed to construct file metadata")
         });
 
-    let metadata = cache.put(&object_meta, metadata);
+    let len_before = cache.len();
+    let old_metadata = cache.put(&object_meta, metadata);
+    let len_after = cache.len();
 
-    if metadata.is_none() {
-        println!("Failed to cache metadata for: {}", file_path);
-        return false;
+    if len_after > len_before {
+        println!("Successfully cached new metadata for: {} (cache: {} -> {})", file_path, len_before, len_after);
+        true
+    } else if old_metadata.is_some() {
+        println!("Successfully updated existing metadata for: {} (cache: {})", file_path, len_after);
+        true
+    } else {
+        println!("Failed to cache metadata for: {} (cache: {})", file_path, len_after);
+        false
     }
-
-    println!("Cached metadata for: {}", file_path);
-    true
 }
 
 #[no_mangle]

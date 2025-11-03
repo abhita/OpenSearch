@@ -32,7 +32,7 @@ public interface EngineSearcher<Q,C> extends Releasable {
         throw new UnsupportedOperationException();
     }
 
-    default long search(Q query, Long contextPtr, Long globalRuntimeEnvId, Long tokioRuntimePtr) throws IOException {
+    default long search(Q query, Long globalRuntimeEnvId, Long tokioRuntimePtr) throws IOException {
         throw new UnsupportedOperationException();
     }
 

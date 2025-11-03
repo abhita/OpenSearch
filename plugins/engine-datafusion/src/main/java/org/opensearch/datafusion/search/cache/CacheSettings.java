@@ -24,7 +24,7 @@ public class CacheSettings {
 
     public static final Setting<String> METADATA_CACHE_EVICTION_TYPE = new Setting<String>(
         "datafusion.metadata.cache.eviction.type",
-        "DEFAULT",
+        "LRU",
         Function.identity(),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic

@@ -63,7 +63,7 @@ public class DatafusionSearcher implements EngineSearcher<DatafusionQuery, Recor
 //    }
 
     @Override
-    public long search(DatafusionQuery datafusionQuery, Long contextPtr, Long globalRuntimeEnvId, Long tokioRuntimePtr) {
+    public long search(DatafusionQuery datafusionQuery, Long globalRuntimeEnvId, Long tokioRuntimePtr) {
         return DataFusionQueryJNI.executeSubstraitQuery(reader.getCachePtr(), datafusionQuery.getIndexName(), datafusionQuery.getSubstraitBytes(), globalRuntimeEnvId, tokioRuntimePtr);
     }
 
