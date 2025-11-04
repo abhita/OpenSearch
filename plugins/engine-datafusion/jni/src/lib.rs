@@ -377,8 +377,6 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_nativeC
     session_context_ptr
 }
 
-
-
 #[no_mangle]
 pub extern "system" fn Java_org_opensearch_datafusion_RecordBatchStream_next(
     mut env: JNIEnv,
@@ -997,6 +995,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
             println!("Failed to update statistics cache size limit to: {}", new_size_limit);
         }
     }
+
     true
 }
 
