@@ -19,15 +19,19 @@ import static org.opensearch.datafusion.DataFusionQueryJNI.statisticsCacheClear;
 import static org.opensearch.datafusion.DataFusionQueryJNI.statisticsCacheContainsFile;
 import static org.opensearch.datafusion.DataFusionQueryJNI.statisticsCacheGet;
 import static org.opensearch.datafusion.DataFusionQueryJNI.statisticsCacheGetEntries;
+import static org.opensearch.datafusion.DataFusionQueryJNI.statisticsCacheGetHitCount;
+import static org.opensearch.datafusion.DataFusionQueryJNI.statisticsCacheGetHitRate;
+import static org.opensearch.datafusion.DataFusionQueryJNI.statisticsCacheGetMissCount;
 import static org.opensearch.datafusion.DataFusionQueryJNI.statisticsCacheGetSize;
 import static org.opensearch.datafusion.DataFusionQueryJNI.statisticsCachePut;
 import static org.opensearch.datafusion.DataFusionQueryJNI.statisticsCacheRemove;
+import static org.opensearch.datafusion.DataFusionQueryJNI.statisticsCacheResetStats;
 import static org.opensearch.datafusion.DataFusionQueryJNI.statisticsCacheUpdateSizeLimit;
 import static org.opensearch.datafusion.search.cache.CacheSettings.STATS_CACHE_EVICTION_TYPE;
 import static org.opensearch.datafusion.search.cache.CacheSettings.STATS_CACHE_SIZE_LIMIT;
 import static org.opensearch.datafusion.search.cache.CacheSettings.STATS_CACHE_SIZE_LIMIT_KEY;
 
-public class StatsCacheAccessor extends CacheAccessor{
+public class StatisticsCacheAccessor extends CacheAccessor{
 
     private CachePolicy cachePolicy;
 
@@ -36,7 +40,7 @@ public class StatsCacheAccessor extends CacheAccessor{
     }
 
 
-    public StatsCacheAccessor(long cacheManagerPointer, ClusterSettings cacheSettings, CacheType name) {
+    public StatisticsCacheAccessor(long cacheManagerPointer, ClusterSettings cacheSettings, CacheType name) {
         super(cacheManagerPointer, cacheSettings, name);
     }
 
@@ -109,5 +113,36 @@ public class StatsCacheAccessor extends CacheAccessor{
     @Override
     public List<String> getEntries() {
         return List.of(statisticsCacheGetEntries(this.pointer));
+    }
+
+    /**
+     * Get cache hit count
+     * @return number of cache hits
+     */
+    public long getHitCount() {
+        return statisticsCacheGetHitCount(this.pointer);
+    }
+
+    /**
+     * Get cache miss count
+     * @return number of cache misses
+     */
+    public long getMissCount() {
+        return statisticsCacheGetMissCount(this.pointer);
+    }
+
+    /**
+     * Get cache hit rate
+     * @return hit rate as a value between 0.0 and 1.0
+     */
+    public double getHitRate() {
+        return statisticsCacheGetHitRate(this.pointer);
+    }
+
+    /**
+     * Reset hit and miss counters
+     */
+    public void resetStats() {
+        statisticsCacheResetStats(this.pointer);
     }
 }

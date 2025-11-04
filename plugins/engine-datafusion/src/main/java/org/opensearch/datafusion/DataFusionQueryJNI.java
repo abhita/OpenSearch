@@ -293,4 +293,24 @@ public class DataFusionQueryJNI {
      * @param cachePtr the cache pointer
      */
     public static native void statisticsCacheClear(long cachePtr);
+
+    /**
+     * Get hit count from statistics cache
+     */
+    public static native long statisticsCacheGetHitCount(long cachePtr);
+
+    /**
+     * Get miss count from statistics cache
+     */
+    public static native long statisticsCacheGetMissCount(long cachePtr);
+
+    /**
+     * Get hit rate from statistics cache (returns value between 0.0 and 1.0)
+     */
+    public static native double statisticsCacheGetHitRate(long cachePtr);
+
+    /**
+     * Reset hit and miss counters in statistics cache
+     */
+    public static native void statisticsCacheResetStats(long cachePtr);
 }

@@ -21,22 +21,19 @@ mod util;
 mod row_id_optimizer;
 mod listing_table;
 mod metadata_cache;
+mod statistics_cache;
+mod cache_policy;
 
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::Statistics;
 use datafusion::common::stats::Precision;
 
 use crate::cache_policy::{CacheConfig, PolicyType};
-use crate::listing_table::{ListingOptions, ListingTable, ListingTableConfig};
-use crate::statistics_cache::CustomStatsCache;
-use crate::metadata_cache::MutexFileMetadataCache;
-use crate::row_id_optimizer::FilterRowIdOptimizer;
+use crate::statistics_cache::CustomStatisticsCache;
 use crate::util::{
     construct_file_metadata, create_object_meta_from_file, create_object_meta_from_filenames,
     parse_string_arr, set_object_result_error, set_object_result_ok,
 };
-use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionConfig;
 use datafusion::DATAFUSION_VERSION;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -51,9 +48,11 @@ use tokio::runtime::Runtime;
 use crate::listing_table::{ListingOptions, ListingTable, ListingTableConfig};
 use crate::row_id_optimizer::FilterRowIdOptimizer;
 use crate::metadata_cache::{MutexFileMetadataCache};
-use crate::util::{construct_file_metadata, create_object_meta_from_file, create_object_meta_from_filenames, parse_string_arr, set_object_result_error, set_object_result_ok};
-
 use datafusion::datasource::file_format::csv::CsvFormat;
+use datafusion::execution::cache::cache_manager::{self, CacheManagerConfig, FileMetadataCache};
+use datafusion::execution::cache::cache_unit::{
+    DefaultFileStatisticsCache, DefaultFilesMetadataCache, DefaultListFilesCache,
+};
 use datafusion::datasource::listing::{ListingTableUrl};
 use datafusion::execution::cache::cache_manager::{self, CacheManagerConfig, FileMetadataCache};
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
@@ -61,6 +60,7 @@ use datafusion::datasource::physical_plan::FileMeta;
 use datafusion::execution::cache::cache_unit::{DefaultFilesMetadataCache, DefaultListFilesCache};
 use datafusion::execution::cache::CacheAccessor;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion_datasource::ListingTableUrl;
 
 
 /// Create a new DataFusion session context
@@ -701,7 +701,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createS
         size_limit: size_limit as usize,
         eviction_threshold: 0.8,
     };
-    let memory_aware_cache = CustomStatsCache::new(config);
+    let memory_aware_cache = CustomStatisticsCache::new(config);
 
     // Create a new DefaultFileStatisticsCache for the CacheManagerConfig
     let stats_cache = Arc::new(DefaultFileStatisticsCache::default());
@@ -714,7 +714,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createS
             .with_files_statistics_cache(Some(stats_cache));
     }
 
-    // Return the CustomStatsCache pointer for JNI operations
+    // Return the CustomStatisticsCache pointer for JNI operations
     Box::into_raw(Box::new(memory_aware_cache)) as jlong
 }
 
@@ -730,7 +730,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
         Err(_) => return false,
     };
 
-    let cache = unsafe { &*(cache_ptr as *const CustomStatsCache) };
+    let cache =  unsafe { &mut *(cache_ptr as *mut CustomStatisticsCache) };
     let data_format = if file_path.to_lowercase().ends_with(".parquet") {
         "parquet"
     } else {
@@ -850,10 +850,15 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
         }
     };
 
-    let cache = unsafe { &*(cache_ptr as *const CustomStatsCache) };
+    let cache = unsafe { &mut *(cache_ptr as *mut CustomStatisticsCache) };
 
-    let _ = cache.remove_internal(&path_obj);
-    true
+    if let Some(_cache_obj) = cache.remove(&path_obj){
+        println!("Cache removed for: {}", file_path);
+        true
+    } else {
+        println!("Item not found in cache: {}", file_path);
+        false
+    }
 }
 
 #[no_mangle]
@@ -868,7 +873,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
         Err(_) => return false,
     };
 
-    let cache = unsafe { &*(cache_ptr as *const CustomStatsCache) };
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
     let path_obj = match object_store::path::Path::from_url_path(&file_path) {
         Ok(path) => path,
         Err(_) => {
@@ -889,62 +894,48 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
     }
 }
 
-// #[no_mangle]
-// pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheGetEntries(
-//     mut env: JNIEnv,
-//     _class: JClass,
-//     cache_ptr: jlong,
-// ) -> jni::sys::jobjectArray {
-//     let cache = unsafe { &*(cache_ptr as *const DefaultFileStatisticsCache) };
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheGetEntries(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+) -> jni::sys::jobjectArray {
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
 
-//     // Get all entries from the cache
-//     let entries = cache.list_entries();
+    // Get all entries from the DashMap
+    let entries: Vec<_> = cache.inner().iter().collect();
 
-//     println!("Retrieved {} statistics cache entries", entries.len());
+    println!("Retrieved {} statistics cache entries", entries.len());
 
-//     // Create String array class
-//     let string_class = match env.find_class("java/lang/String") {
-//         Ok(cls) => cls,
-//         Err(e) => {
-//             println!("Failed to find String class: {:?}", e);
-//             return std::ptr::null_mut();
-//         }
-//     };
+    // Create String array class
+    let string_class = match env.find_class("java/lang/String") {
+        Ok(cls) => cls,
+        Err(e) => {
+            println!("Failed to find String class: {:?}", e);
+            return std::ptr::null_mut();
+        }
+    };
 
-//     // Create array with size = number of entries * 3 (path, size, hit_count for each entry)
-//     let array_size = (entries.len() * 3) as i32;
-//     let result_array = match env.new_object_array(array_size, &string_class, JObject::null()) {
-//         Ok(arr) => arr,
-//         Err(e) => {
-//             println!("Failed to create object array: {:?}", e);
-//             return std::ptr::null_mut();
-//         }
-//     };
+    // Create array with just the paths
+    let array_size = entries.len() as i32;
+    let result_array = match env.new_object_array(array_size, &string_class, JObject::null()) {
+        Ok(arr) => arr,
+        Err(e) => {
+            println!("Failed to create object array: {:?}", e);
+            return std::ptr::null_mut();
+        }
+    };
 
-//     // Fill the array with entries
-//     let mut index = 0;
-//     for (path, entry) in entries.iter() {
-//         // Add path
-//         if let Ok(path_str) = env.new_string(path.as_ref()) {
-//             let _ = env.set_object_array_element(&result_array, index, path_str);
-//         }
-//         index += 1;
+    // Fill the array with entry paths
+    for (index, entry) in entries.iter().enumerate() {
+        let path_str = entry.key().to_string();
+        if let Ok(jstr) = env.new_string(path_str) {
+            let _ = env.set_object_array_element(&result_array, index as i32, jstr);
+        }
+    }
 
-//         // Add size
-//         if let Ok(size_str) = env.new_string(entry.size_bytes.to_string()) {
-//             let _ = env.set_object_array_element(&result_array, index, size_str);
-//         }
-//         index += 1;
-
-//         // Add hit_count
-//         if let Ok(hit_count_str) = env.new_string(entry.hits.to_string()) {
-//             let _ = env.set_object_array_element(&result_array, index, hit_count_str);
-//         }
-//         index += 1;
-//     }
-
-//     result_array.as_raw()
-// }
+    result_array.as_raw()
+}
 
 /// Get current memory usage from statistics cache
 #[no_mangle]
@@ -953,7 +944,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
     _class: JClass,
     cache_ptr: jlong,
 ) -> jlong {
-    let cache = unsafe { &*(cache_ptr as *const CustomStatsCache) };
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
 
     // Return actual memory consumed by the cache entries
     cache.memory_consumed() as jlong
@@ -970,7 +961,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
         Ok(s) => s.into(),
         Err(_) => return false,
     };
-    let cache = unsafe { &*(cache_ptr as *const CustomStatsCache) };
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
 
     let path_obj = match object_store::path::Path::from_url_path(&file_path) {
         Ok(path) => path,
@@ -985,12 +976,12 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
 /// Update size limit for statistics cache
 #[no_mangle]
 pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheUpdateSizeLimit(
-    _env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     cache_ptr: jlong,
     new_size_limit: jlong,
 ) -> bool {
-    let cache = unsafe { &mut *(cache_ptr as *mut CustomStatsCache) };
+    let cache = unsafe { &mut *(cache_ptr as *mut CustomStatisticsCache) };
 
     // Update size limit using the policy cache's functionality
     match cache.update_size_limit(new_size_limit as usize) {
@@ -1010,9 +1001,54 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
     _class: JClass,
     cache_ptr: jlong,
 ) {
-    let cache = unsafe { &*(cache_ptr as *const CustomStatsCache) };
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
     cache.clear();
     println!("Statistics cache cleared");
+}
+
+/// Get hit count from statistics cache
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheGetHitCount(
+    _env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+) -> jlong {
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
+    cache.hit_count() as jlong
+}
+
+/// Get miss count from statistics cache
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheGetMissCount(
+    _env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+) -> jlong {
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
+    cache.miss_count() as jlong
+}
+
+/// Get hit rate from statistics cache (returns value between 0.0 and 1.0)
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheGetHitRate(
+    _env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+) -> f64 {
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
+    cache.hit_rate()
+}
+
+/// Reset hit and miss counters in statistics cache
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheResetStats(
+    _env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+) {
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
+    cache.reset_stats();
+    println!("Statistics cache hit/miss counters reset");
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use crate::cache_policy::{
 use arrow_array::Array;
 use datafusion::common::stats::{ColumnStatistics, Precision};
 use datafusion::common::ScalarValue;
-use datafusion::execution::cache::cache_unit::DefaultFileStatisticsCache;
+use dashmap::DashMap;
 use datafusion::execution::cache::CacheAccessor;
 use datafusion::physical_plan::Statistics;
 use object_store::{path::Path, ObjectMeta};
@@ -102,9 +102,9 @@ impl StatisticsMemorySize for Statistics {
 ///
 /// This cache leverages DashMap's built-in concurrency from DefaultFileStatisticsCache
 /// and adds memory tracking + policy-based eviction on top.
-pub struct CustomStatsCache {
+pub struct CustomStatisticsCache {
     /// The underlying DataFusion statistics cache (DashMap-based, already thread-safe)
-    inner_cache: DefaultFileStatisticsCache,
+    inner_cache: DashMap<Path, (ObjectMeta, Arc<Statistics>)>,
     /// The eviction policy (thread-safe)
     policy: Arc<Mutex<Box<dyn CachePolicy>>>,
     /// Cache configuration
@@ -113,20 +113,26 @@ pub struct CustomStatsCache {
     memory_tracker: Arc<Mutex<HashMap<String, usize>>>,
     /// Total memory consumed by all entries (thread-safe)
     total_memory: Arc<Mutex<usize>>,
+    /// Cache hit count (thread-safe)
+    hit_count: Arc<Mutex<usize>>,
+    /// Cache miss count (thread-safe)
+    miss_count: Arc<Mutex<usize>>,
 }
 
-impl CustomStatsCache {
+impl CustomStatisticsCache {
     /// Create a new custom statistics cache
     pub fn new(config: CacheConfig) -> Self {
-        let inner_cache = DefaultFileStatisticsCache::default();
+        let inner_cache = DashMap::new();
         let policy = Arc::new(Mutex::new(create_policy(config.policy_type.clone())));
 
         Self {
             inner_cache,
             policy,
-            config, // No mutex needed - we can update it when needed
+            config,
             memory_tracker: Arc::new(Mutex::new(HashMap::new())),
             total_memory: Arc::new(Mutex::new(0)),
+            hit_count: Arc::new(Mutex::new(0)),
+            miss_count: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -136,7 +142,7 @@ impl CustomStatsCache {
     }
 
     /// Get the underlying cache for compatibility
-    pub fn inner(&self) -> &DefaultFileStatisticsCache {
+    pub fn inner(&self) -> &DashMap<Path,(ObjectMeta, Arc<Statistics>)> {
         &self.inner_cache
     }
 
@@ -145,10 +151,43 @@ impl CustomStatsCache {
         self.total_memory.lock().map(|guard| *guard).unwrap_or(0)
     }
 
+    /// Get cache hit count
+    pub fn hit_count(&self) -> usize {
+        self.hit_count.lock().map(|guard| *guard).unwrap_or(0)
+    }
+
+    /// Get cache miss count
+    pub fn miss_count(&self) -> usize {
+        self.miss_count.lock().map(|guard| *guard).unwrap_or(0)
+    }
+
+    /// Get cache hit rate (returns value between 0.0 and 1.0)
+    pub fn hit_rate(&self) -> f64 {
+        let hits = self.hit_count();
+        let misses = self.miss_count();
+        let total = hits + misses;
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
+    }
+
+    /// Reset hit and miss counters
+    pub fn reset_stats(&self) {
+        if let Ok(mut hits) = self.hit_count.lock() {
+            *hits = 0;
+        }
+        if let Ok(mut misses) = self.miss_count.lock() {
+            *misses = 0;
+        }
+    }
+
     /// Update the cache size limit
-    pub fn update_size_limit(&self, new_limit: usize) -> CacheResult<()> {
-        // Note: We can't update self.config.size_limit here since we don't have &mut self
-        // For now, we'll trigger eviction based on the new limit
+    pub fn update_size_limit(&mut self, new_limit: usize) -> CacheResult<()> {
+        // Update the config size limit
+        self.config.size_limit = new_limit;
+
         let current_size = self.current_size()?;
         if current_size > new_limit {
             let target_eviction = current_size - (new_limit as f64 * 0.8) as usize;
@@ -199,39 +238,21 @@ impl CustomStatsCache {
         Ok(self.memory_consumed())
     }
 
-    /// Check if eviction is needed and trigger it
-    pub fn evict_if_needed(&self) -> CacheResult<usize> {
-        let current_size = self.current_size()?;
-        // Use a default threshold since we can't access self.config without &mut
-        let threshold_size = (self.config.size_limit as f64 * 0.8) as usize;
-
-        if current_size > threshold_size {
-            let target_eviction = current_size - threshold_size;
-            self.evict(target_eviction)
-        } else {
-            Ok(0)
-        }
-    }
-
-    /// Manually trigger eviction to free up specified amount of memory
-    pub fn evict(&self, target_size: usize) -> CacheResult<usize> {
+    /// Manually trigger eviction (requires &mut self)
+    pub fn evict(&mut self, target_size: usize) -> CacheResult<usize> {
         if target_size == 0 {
             return Ok(0);
         }
 
         let candidates = {
-            let policy_guard = self
-                .policy
-                .lock()
-                .map_err(|e| CacheError::PolicyLockError {
-                    reason: format!("Failed to acquire policy lock: {}", e),
-                })?;
+            let policy_guard = self.policy.lock().map_err(|e| CacheError::PolicyLockError {
+                reason: format!("Failed to acquire policy lock: {}", e),
+            })?;
             policy_guard.select_for_eviction(target_size)
         };
 
         let mut freed_size = 0;
         for key in candidates {
-            // Get memory size before removal
             let entry_size = if let Ok(tracker) = self.memory_tracker.lock() {
                 tracker.get(&key).copied().unwrap_or(0)
             } else {
@@ -239,12 +260,24 @@ impl CustomStatsCache {
             };
 
             if entry_size > 0 {
-                // Parse key back to path and remove
                 if let Ok(path) = self.parse_key_to_path(&key) {
-                    self.remove_internal(&path);
-                    freed_size += entry_size;
+                    if self.inner_cache.remove(&path).is_some() {
+                        // Update memory tracking
+                        if let Ok(mut tracker) = self.memory_tracker.lock() {
+                            if let Ok(mut total) = self.total_memory.lock() {
+                                tracker.remove(&key);
+                                *total = total.saturating_sub(entry_size);
+                            }
+                        }
 
-                    // Stop if we've freed enough
+                        // Notify policy
+                        if let Ok(mut policy_guard) = self.policy.lock() {
+                            policy_guard.on_remove(&key);
+                        }
+
+                        freed_size += entry_size;
+                    }
+
                     if freed_size >= target_size {
                         break;
                     }
@@ -260,40 +293,49 @@ impl CustomStatsCache {
         Ok(Path::from(key))
     }
 
-    /// Remove implementation that works with &self using interior mutability
-    /// This allows removal without requiring &mut self
-    pub fn remove_internal(&self, k: &Path) -> Option<Arc<Statistics>> {
+    /// Remove entry internally (works with &self since inner_cache is thread-safe)
+    fn remove_internal(&self, k: &Path) -> Option<Arc<Statistics>> {
         let key = k.to_string();
 
-        // Get the value before removal
-        let result = self.inner_cache.get(k);
+        // Actually remove from the underlying cache (DashMap allows this with &self)
+        let result = self.inner_cache.remove(k);
 
-        // Update memory tracking
-        if let Ok(mut tracker) = self.memory_tracker.lock() {
-            if let Ok(mut total) = self.total_memory.lock() {
-                if let Some(old_size) = tracker.remove(&key) {
-                    *total = total.saturating_sub(old_size);
+        // Only proceed with tracking updates if the entry existed
+        if result.is_some() {
+            // Update memory tracking
+            if let Ok(mut tracker) = self.memory_tracker.lock() {
+                if let Ok(mut total) = self.total_memory.lock() {
+                    if let Some(old_size) = tracker.remove(&key) {
+                        *total = total.saturating_sub(old_size);
+                    }
                 }
+            }
+
+            // Notify policy of removal
+            if let Ok(mut policy_guard) = self.policy.lock() {
+                policy_guard.on_remove(&key);
             }
         }
 
-        // Notify policy of removal
-        if let Ok(mut policy_guard) = self.policy.lock() {
-            policy_guard.on_remove(&key);
-        }
-
-        result
+        result.map(|x| x.1 .1)
     }
+
+
 }
 
 // Implement CacheAccessor - DashMap handles concurrency, we just need to handle the &mut self requirement
-impl CacheAccessor<Path, Arc<Statistics>> for CustomStatsCache {
+impl CacheAccessor<Path, Arc<Statistics>> for CustomStatisticsCache {
     type Extra = ObjectMeta;
 
     fn get(&self, k: &Path) -> Option<Arc<Statistics>> {
         let result = self.inner_cache.get(k);
 
         if result.is_some() {
+            // Increment hit count
+            if let Ok(mut hits) = self.hit_count.lock() {
+                *hits += 1;
+            }
+
             // Notify policy of access
             let key = k.to_string();
             let memory_size = if let Ok(tracker) = self.memory_tracker.lock() {
@@ -305,9 +347,15 @@ impl CacheAccessor<Path, Arc<Statistics>> for CustomStatsCache {
             if let Ok(mut policy_guard) = self.policy.lock() {
                 policy_guard.on_access(&key, memory_size);
             }
+        } else {
+            // Increment miss count
+            if let Ok(mut misses) = self.miss_count.lock() {
+                *misses += 1;
+            }
         }
 
-        result
+        result.map(|s| Some(Arc::clone(&s.value().1)))
+            .unwrap_or(None)
     }
 
     fn get_with_extra(&self, k: &Path, _extra: &Self::Extra) -> Option<Arc<Statistics>> {
@@ -334,11 +382,29 @@ impl CacheAccessor<Path, Arc<Statistics>> for CustomStatsCache {
         let key = k.to_string();
         let memory_size = v.memory_size();
 
-        // Check if we need to evict before inserting
-        let _ = self.evict_if_needed();
+        // Check if eviction is needed BEFORE inserting
+        let current_size = self.memory_consumed();
+        if current_size + memory_size > (self.config.size_limit as f64 * 0.8) as usize {
+            let target_eviction = (current_size + memory_size) - (self.config.size_limit as f64 * 0.6) as usize;
+
+            // Perform actual eviction using remove_internal
+            let candidates = {
+                if let Ok(policy_guard) = self.policy.lock() {
+                    policy_guard.select_for_eviction(target_eviction)
+                } else {
+                    vec![]
+                }
+            };
+
+            for candidate_key in candidates {
+                if let Ok(path) = self.parse_key_to_path(&candidate_key) {
+                    self.remove_internal(&path);
+                }
+            }
+        }
 
         // Put in the underlying cache (DashMap handles concurrency)
-        let result = self.inner_cache.put_with_extra(k, v.clone(), e);
+        let result = self.inner_cache.insert(k.clone(), (e.clone(), v)).map(|x| x.1);
 
         // Track memory usage
         if let Ok(mut tracker) = self.memory_tracker.lock() {
@@ -385,7 +451,7 @@ impl CacheAccessor<Path, Arc<Statistics>> for CustomStatsCache {
             }
         }
 
-        result
+        result.map(|x| x.1 .1)
     }
 
     fn contains_key(&self, k: &Path) -> bool {
@@ -397,6 +463,9 @@ impl CacheAccessor<Path, Arc<Statistics>> for CustomStatsCache {
     }
 
     fn clear(&self) {
+        // Clear the DashMap cache
+        self.inner_cache.clear();
+
         // Clear memory tracking
         if let Ok(mut tracker) = self.memory_tracker.lock() {
             tracker.clear();
@@ -411,19 +480,19 @@ impl CacheAccessor<Path, Arc<Statistics>> for CustomStatsCache {
             policy_guard.clear();
         }
 
-        // Note: DefaultFileStatisticsCache doesn't support clear
-        // but we've reset our tracking
+        // Reset hit/miss counters
+        self.reset_stats();
     }
 
     fn name(&self) -> String {
         format!(
-            "CustomStatsCache({})",
+            "CustomStatisticsCache({})",
             self.policy_name().unwrap_or_else(|_| "unknown".to_string())
         )
     }
 }
 
-impl Default for CustomStatsCache {
+impl Default for CustomStatisticsCache {
     fn default() -> Self {
         Self::with_default_config()
     }
@@ -465,7 +534,7 @@ mod tests {
             eviction_threshold: 0.8,
         };
 
-        let cache = CustomStatsCache::new(config);
+        let cache = CustomStatisticsCache::new(config);
         assert_eq!(cache.policy_name().unwrap(), "lru");
         assert_eq!(cache.memory_consumed(), 0);
         assert_eq!(cache.len(), 0);
@@ -473,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_memory_tracking_with_policy() {
-        let cache = CustomStatsCache::with_default_config();
+        let cache = CustomStatisticsCache::with_default_config();
 
         // Initially empty
         assert_eq!(cache.memory_consumed(), 0);
@@ -502,7 +571,7 @@ mod tests {
             size_limit: 1000, // Small limit to trigger eviction
             eviction_threshold: 0.8,
         };
-        let cache = CustomStatsCache::new(config);
+        let cache = CustomStatisticsCache::new(config);
 
         // Add multiple entries to trigger eviction
         for i in 0..10 {
@@ -524,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_manual_eviction_with_memory_tracking() {
-        let cache = CustomStatsCache::with_default_config();
+        let mut cache = CustomStatisticsCache::with_default_config();
 
         // Add entries
         for i in 0..5 {
@@ -547,7 +616,7 @@ mod tests {
 
     #[test]
     fn test_policy_switching_with_memory() {
-        let mut cache = CustomStatsCache::with_default_config();
+        let mut cache = CustomStatisticsCache::with_default_config();
 
         // Add some entries
         for i in 0..3 {
@@ -571,7 +640,7 @@ mod tests {
 
     #[test]
     fn test_remove_with_memory_tracking() {
-        let mut cache = CustomStatsCache::with_default_config();
+        let mut cache = CustomStatisticsCache::with_default_config();
 
         // Add entries
         let path1 = create_test_path("file1");
@@ -602,7 +671,7 @@ mod tests {
 
     #[test]
     fn test_clear_with_memory_tracking() {
-        let cache = CustomStatsCache::with_default_config();
+        let cache = CustomStatisticsCache::with_default_config();
 
         // Add multiple entries
         for i in 0..3 {
@@ -629,7 +698,7 @@ mod tests {
             size_limit: 2000, // Limit to ~2 entries
             eviction_threshold: 0.8,
         };
-        let cache = CustomStatsCache::new(config);
+        let cache = CustomStatisticsCache::new(config);
 
         // Add entries
         let mut paths = vec![];
@@ -661,7 +730,7 @@ mod tests {
             size_limit: 2000, // Limit to ~2 entries
             eviction_threshold: 0.8,
         };
-        let cache = CustomStatsCache::new(config);
+        let cache = CustomStatisticsCache::new(config);
 
         // Add entries
         let mut paths = vec![];
@@ -693,7 +762,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let cache = Arc::new(CustomStatsCache::with_default_config());
+        let cache = Arc::new(CustomStatisticsCache::with_default_config());
         let mut handles = vec![];
 
         // Spawn multiple threads doing concurrent operations
@@ -721,5 +790,260 @@ mod tests {
 
         // Cache should have entries
         assert!(cache.len() > 0);
+    }
+
+    #[test]
+    fn test_hit_count_tracking() {
+        let cache = CustomStatisticsCache::with_default_config();
+
+        // Initially zero
+        assert_eq!(cache.hit_count(), 0);
+        assert_eq!(cache.miss_count(), 0);
+
+        // Add an entry
+        let path = create_test_path("file1");
+        let meta = create_test_meta(&path);
+        let stats = Arc::new(create_test_statistics());
+        cache.put_with_extra(&path, stats, &meta);
+
+        // Get the entry - should increment hit count
+        assert!(cache.get(&path).is_some());
+        assert_eq!(cache.hit_count(), 1);
+        assert_eq!(cache.miss_count(), 0);
+
+        // Get it again - should increment hit count again
+        assert!(cache.get(&path).is_some());
+        assert_eq!(cache.hit_count(), 2);
+        assert_eq!(cache.miss_count(), 0);
+    }
+
+    #[test]
+    fn test_miss_count_tracking() {
+        let cache = CustomStatisticsCache::with_default_config();
+
+        // Initially zero
+        assert_eq!(cache.hit_count(), 0);
+        assert_eq!(cache.miss_count(), 0);
+
+        // Try to get non-existent entry - should increment miss count
+        let path = create_test_path("nonexistent");
+        assert!(cache.get(&path).is_none());
+        assert_eq!(cache.hit_count(), 0);
+        assert_eq!(cache.miss_count(), 1);
+
+        // Try again - should increment miss count again
+        assert!(cache.get(&path).is_none());
+        assert_eq!(cache.hit_count(), 0);
+        assert_eq!(cache.miss_count(), 2);
+    }
+
+    #[test]
+    fn test_hit_miss_mixed_operations() {
+        let cache = CustomStatisticsCache::with_default_config();
+
+        // Add some entries
+        let path1 = create_test_path("file1");
+        let path2 = create_test_path("file2");
+        let meta1 = create_test_meta(&path1);
+        let meta2 = create_test_meta(&path2);
+        let stats = Arc::new(create_test_statistics());
+
+        cache.put_with_extra(&path1, stats.clone(), &meta1);
+        cache.put_with_extra(&path2, stats, &meta2);
+
+        // Mix of hits and misses
+        assert!(cache.get(&path1).is_some()); // hit
+        assert_eq!(cache.hit_count(), 1);
+        assert_eq!(cache.miss_count(), 0);
+
+        let path3 = create_test_path("file3");
+        assert!(cache.get(&path3).is_none()); // miss
+        assert_eq!(cache.hit_count(), 1);
+        assert_eq!(cache.miss_count(), 1);
+
+        assert!(cache.get(&path2).is_some()); // hit
+        assert_eq!(cache.hit_count(), 2);
+        assert_eq!(cache.miss_count(), 1);
+
+        assert!(cache.get(&path3).is_none()); // miss again
+        assert_eq!(cache.hit_count(), 2);
+        assert_eq!(cache.miss_count(), 2);
+
+        assert!(cache.get(&path1).is_some()); // hit again
+        assert_eq!(cache.hit_count(), 3);
+        assert_eq!(cache.miss_count(), 2);
+    }
+
+    #[test]
+    fn test_hit_rate_calculation() {
+        let cache = CustomStatisticsCache::with_default_config();
+
+        // Initially 0.0 (no operations)
+        assert_eq!(cache.hit_rate(), 0.0);
+
+        // Add entries
+        let path1 = create_test_path("file1");
+        let path2 = create_test_path("file2");
+        let meta1 = create_test_meta(&path1);
+        let meta2 = create_test_meta(&path2);
+        let stats = Arc::new(create_test_statistics());
+
+        cache.put_with_extra(&path1, stats.clone(), &meta1);
+        cache.put_with_extra(&path2, stats, &meta2);
+
+        // 2 hits, 0 misses = 100% hit rate
+        cache.get(&path1);
+        cache.get(&path2);
+        assert_eq!(cache.hit_rate(), 1.0);
+
+        // 2 hits, 1 miss = 66.67% hit rate
+        let path3 = create_test_path("file3");
+        cache.get(&path3);
+        assert!((cache.hit_rate() - 0.6666666666666666).abs() < 0.0001);
+
+        // 3 hits, 1 miss = 75% hit rate
+        cache.get(&path1);
+        assert_eq!(cache.hit_rate(), 0.75);
+
+        // 3 hits, 2 misses = 60% hit rate
+        cache.get(&path3);
+        assert_eq!(cache.hit_rate(), 0.6);
+    }
+
+    #[test]
+    fn test_reset_stats() {
+        let cache = CustomStatisticsCache::with_default_config();
+
+        // Add entry and generate some hits/misses
+        let path = create_test_path("file1");
+        let meta = create_test_meta(&path);
+        let stats = Arc::new(create_test_statistics());
+        cache.put_with_extra(&path, stats, &meta);
+
+        cache.get(&path); // hit
+        let path2 = create_test_path("file2");
+        cache.get(&path2); // miss
+
+        assert_eq!(cache.hit_count(), 1);
+        assert_eq!(cache.miss_count(), 1);
+        assert_eq!(cache.hit_rate(), 0.5);
+
+        // Reset stats
+        cache.reset_stats();
+
+        assert_eq!(cache.hit_count(), 0);
+        assert_eq!(cache.miss_count(), 0);
+        assert_eq!(cache.hit_rate(), 0.0);
+
+        // Cache entries should still exist
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(&path).is_some());
+
+        // After reset, new operations should start counting from zero
+        assert_eq!(cache.hit_count(), 1);
+        assert_eq!(cache.miss_count(), 0);
+    }
+
+    #[test]
+    fn test_clear_resets_stats() {
+        let cache = CustomStatisticsCache::with_default_config();
+
+        // Add entries and generate hits/misses
+        let path = create_test_path("file1");
+        let meta = create_test_meta(&path);
+        let stats = Arc::new(create_test_statistics());
+        cache.put_with_extra(&path, stats, &meta);
+
+        cache.get(&path); // hit
+        let path2 = create_test_path("file2");
+        cache.get(&path2); // miss
+
+        assert_eq!(cache.hit_count(), 1);
+        assert_eq!(cache.miss_count(), 1);
+
+        // Clear should reset stats
+        cache.clear();
+
+        assert_eq!(cache.hit_count(), 0);
+        assert_eq!(cache.miss_count(), 0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn test_hit_miss_with_eviction() {
+        let config = CacheConfig {
+            policy_type: PolicyType::Lru,
+            size_limit: 1500, // Small limit to trigger eviction
+            eviction_threshold: 0.8,
+        };
+        let cache = CustomStatisticsCache::new(config);
+
+        // Add multiple entries to trigger eviction
+        let mut paths = vec![];
+        for i in 0..5 {
+            let path = create_test_path(&format!("file{}", i));
+            let meta = create_test_meta(&path);
+            let stats = Arc::new(create_test_statistics());
+            paths.push(path.clone());
+            cache.put_with_extra(&path, stats, &meta);
+        }
+
+        // Access some entries
+        cache.get(&paths[0]); // May or may not be evicted
+        cache.get(&paths[4]); // Should still be there
+
+        let hits_before = cache.hit_count();
+        let misses_before = cache.miss_count();
+
+        // Try to access potentially evicted entries
+        for path in &paths {
+            cache.get(path);
+        }
+
+        // Should have more hits and/or misses
+        assert!(cache.hit_count() >= hits_before);
+        assert!(cache.miss_count() >= misses_before);
+        assert!(cache.hit_count() + cache.miss_count() > hits_before + misses_before);
+    }
+
+    #[test]
+    fn test_concurrent_hit_miss_tracking() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let cache = Arc::new(CustomStatisticsCache::with_default_config());
+
+        // Add some entries
+        for i in 0..5 {
+            let path = create_test_path(&format!("file{}", i));
+            let meta = create_test_meta(&path);
+            let stats = Arc::new(create_test_statistics());
+            cache.put_with_extra(&path, stats, &meta);
+        }
+
+        let mut handles = vec![];
+
+        // Spawn threads that will generate hits and misses
+        for i in 0..10 {
+            let cache_clone = Arc::clone(&cache);
+            let handle = thread::spawn(move || {
+                // Mix of hits and misses
+                let existing_path = create_test_path(&format!("file{}", i % 5));
+                cache_clone.get(&existing_path); // hit
+
+                let nonexistent_path = create_test_path(&format!("missing{}", i));
+                cache_clone.get(&nonexistent_path); // miss
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Should have 10 hits and 10 misses
+        assert_eq!(cache.hit_count(), 10);
+        assert_eq!(cache.miss_count(), 10);
+        assert_eq!(cache.hit_rate(), 0.5);
     }
 }

@@ -56,7 +56,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             policy_type: PolicyType::Lru,
-            size_limit: 100 * 1024 * 1024, // 100MB
+            size_limit: 20 * 1024 * 1024, // 20MB
             eviction_threshold: 0.8,
         }
     }
@@ -143,6 +143,7 @@ impl CachePolicy for LruPolicy {
     }
 
     fn select_for_eviction(&self, target_size: usize) -> Vec<String> {
+        println!("info seleectpon");
         if target_size == 0 {
             return Vec::new();
         }
@@ -172,7 +173,8 @@ impl CachePolicy for LruPolicy {
 
             if let Some(entry) = self.entries.get(&key) {
                 freed_size += entry.size;
-                candidates.push(key);
+                candidates.push(key.clone());
+                println!("Selected :{}",key);
             }
         }
 

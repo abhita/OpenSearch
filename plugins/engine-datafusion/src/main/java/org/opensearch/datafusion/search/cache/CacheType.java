@@ -8,7 +8,7 @@ import static org.opensearch.datafusion.search.cache.CacheSettings.STATS_CACHE_E
 
 public enum CacheType {
     METADATA(MetadataCacheAccessor::new, METADATA_CACHE_ENABLED),
-    STATS(StatsCacheAccessor::new, STATS_CACHE_ENABLED);
+    STATISTICS(StatisticsCacheAccessor::new, STATS_CACHE_ENABLED);
 
     private final CacheFactory factory;
     private final Setting<Boolean> enabledSetting;
