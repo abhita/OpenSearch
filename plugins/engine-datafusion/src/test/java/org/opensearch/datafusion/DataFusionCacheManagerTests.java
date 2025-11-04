@@ -65,27 +65,33 @@ public class DataFusionCacheManagerTests extends OpenSearchTestCase {
     public void testAddFileToCache() {
         CacheManager cacheManager = service.getCacheManager();
         CacheAccessor metadataCache = cacheManager.getCacheAccessor(CacheType.METADATA);
+        CacheAccessor statisticsCache = cacheManager.getCacheAccessor(CacheType.STATISTICS);
         String fileName = getResourceFile("hits1.parquet").getPath();
 
         cacheManager.addToCache(List.of(fileName));
 
         assertTrue((Boolean) metadataCache.get(fileName));
+        assertTrue((Boolean) statisticsCache.get(fileName));
         assertTrue(metadataCache.containsFile(fileName));
+        assertTrue(statisticsCache.containsFile(fileName));
         assertTrue(metadataCache.getMemoryConsumed() > 0);
     }
 
     public void testRemoveFileFromCache() {
         CacheManager cacheManager = service.getCacheManager();
         CacheAccessor metadataCache = cacheManager.getCacheAccessor(CacheType.METADATA);
+        CacheAccessor statisticsCache = cacheManager.getCacheAccessor(CacheType.STATISTICS);
         String fileName = getResourceFile("hits1.parquet").getPath();
 
         cacheManager.addToCache(List.of(fileName));
         assertTrue(metadataCache.containsFile(fileName));
+        assertTrue(statisticsCache.containsFile(fileName));
 
         boolean removed = cacheManager.removeFiles(List.of(fileName));
 
         assertTrue(removed);
         assertFalse(metadataCache.containsFile(fileName));
+        assertFalse(statisticsCache.containsFile(fileName));
     }
 
     public void testCacheSizeLimitEviction() {
@@ -98,6 +104,74 @@ public class DataFusionCacheManagerTests extends OpenSearchTestCase {
         metadataCache.setSizeLimit(new ByteSizeValue(40));
 
         assertFalse(metadataCache.containsFile(fileName));
+        assertEquals(0, metadataCache.getEntries().size());
+    }
+
+    public void testCachePutWithIncreasedSizeLimit() {
+        CacheAccessor metadataCache = service.getCacheManager().getCacheAccessor(CacheType.METADATA);
+        String fileName = getResourceFile("hits1.parquet").getPath();
+
+        metadataCache.setSizeLimit(new ByteSizeValue(500000));
+        metadataCache.put(fileName);
+
+        assertTrue(metadataCache.containsFile(fileName));
+        logger.info("Entries: {}", metadataCache.getEntries());
+        //(we print 3 elements per entry : filePath, memorySize, HitCount)
+        assertEquals(1*3, metadataCache.getEntries().size());
+    }
+
+    public void testCacheClear() {
+        CacheAccessor metadataCache = service.getCacheManager().getCacheAccessor(CacheType.METADATA);
+        String fileName = getResourceFile("hits1.parquet").getPath();
+
+        metadataCache.put(fileName);
+        assertTrue(metadataCache.containsFile(fileName));
+
+        metadataCache.clear();
+
+        assertFalse(metadataCache.containsFile(fileName));
+        assertEquals(0, metadataCache.getEntries().size());
+    }
+
+    public void testAddMultipleFilesToCache() {
+        CacheManager cacheManager = service.getCacheManager();
+        CacheAccessor metadataCache = cacheManager.getCacheAccessor(CacheType.METADATA);
+        List<String> fileNames = List.of(
+            getResourceFile("hits1.parquet").getPath(),
+            getResourceFile("hits2.parquet").getPath()
+        );
+
+        cacheManager.addToCache(fileNames);
+        // 3 elements per cache entry displayed
+        assertEquals(2*3, metadataCache.getEntries().size());
+        fileNames.forEach(fileName -> assertTrue(metadataCache.containsFile(fileName)));
+    }
+
+    public void testRemoveNonExistentFile() {
+        CacheManager cacheManager = service.getCacheManager();
+        String nonExistentFile = "/path/nonexistent.parquet";
+
+        boolean removed = cacheManager.removeFiles(List.of(nonExistentFile));
+
+        assertFalse(removed);
+    }
+
+    public void testGetNonExistentFile() {
+        CacheAccessor metadataCache = service.getCacheManager().getCacheAccessor(CacheType.METADATA);
+        String nonExistentFile = "/path/nonexistent.parquet";
+
+        Object result = metadataCache.get(nonExistentFile);
+
+//        assertNull(result);
+        assertFalse(metadataCache.containsFile(nonExistentFile));
+    }
+
+    public void testAddEmptyFileList() {
+        CacheManager cacheManager = service.getCacheManager();
+        CacheAccessor metadataCache = cacheManager.getCacheAccessor(CacheType.METADATA);
+
+        cacheManager.addToCache(Collections.emptyList());
+
         assertEquals(0, metadataCache.getEntries().size());
     }
 
