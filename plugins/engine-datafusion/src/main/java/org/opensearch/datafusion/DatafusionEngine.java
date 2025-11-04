@@ -205,11 +205,10 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
                 collector.collect(stream);
             }
 
-            logger.info("Cache entries {}",cacheManager.getCacheAccessor(CacheType.METADATA).getEntries());
-            logger.info("Final Results:");
-            for (Map.Entry<String, Object[]> entry : finalRes.entrySet()) {
-                logger.info("{}: {}", entry.getKey(), java.util.Arrays.toString(entry.getValue()));
-            }
+//            logger.info("Final Results:");
+//            for (Map.Entry<String, Object[]> entry : finalRes.entrySet()) {
+//                logger.info("{}: {}", entry.getKey(), java.util.Arrays.toString(entry.getValue()));
+//            }
 
         } catch (Exception exception) {
             logger.error("Failed to execute Substrait query plan", exception);

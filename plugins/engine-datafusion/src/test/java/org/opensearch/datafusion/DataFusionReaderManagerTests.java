@@ -159,8 +159,8 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
         DatafusionReader reader1 = searcher1.getReader();
 
         // Add new file and refresh
-        // addResourceFilesToShardPath(shardPath, "hits1.parquet");
-        addFilesToShardPath(shardPath, "hits1.parquet");
+       // addResourceFilesToShardPath(shardPath, "hits1.parquet");
+        addFilesToShardPath(shardPath,"hits1.parquet");
         RefreshResult refreshResult2 = new RefreshResult();
         WriterFileSet writerFileSet2 = new WriterFileSet(shardPath.getDataPath(), 2);
         writerFileSet2.add(shardPath.getDataPath() + "/hits3.parquet");
@@ -212,7 +212,7 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
         Map<String, Object[]> finalRes = new HashMap<>();
         DatafusionSearcher datafusionSearcher = null;
 
-        ShardPath shardPath = createShardPathWithResourceFiles("test-index", 0, "hits3.parquet", "hits1.parquet");
+        ShardPath shardPath = createShardPathWithResourceFiles("test-index", 0, "hits3.parquet","hits1.parquet");
 
         try {
             DatafusionEngine engine = new DatafusionEngine(DataFormat.PARQUET, Collections.emptyList(), service, shardPath);
@@ -238,7 +238,7 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
 
             assertEquals(readerR1v2, readerR1);
 
-            addFilesToShardPath(shardPath, "hits2.parquet");
+            addFilesToShardPath(shardPath,"hits2.parquet");
             // now trigger refresh to have new Reader with F2, F3
             RefreshResult refreshResultR2 = new RefreshResult();
             WriterFileSet writerFileSet2 = new WriterFileSet(shardPath.getDataPath(), 2);
@@ -258,14 +258,14 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
             //now we close S1 and automatically R1 will be closed
             datafusionSearcherS1.close();
             // 1 for SearcherS1v2
-            assertEquals(1, getRefCount(readerR1));
+            assertEquals(1,getRefCount(readerR1));
             // 1 for SearcherS2 and 1 for CatalogSnapshot
-            assertEquals(2, getRefCount(readerR2));
+            assertEquals(2,getRefCount(readerR2));
             assertNotEquals(-1, readerR1.cachePtr);
             datafusionSearcher1v2.close();
             assertEquals(-1, readerR1v2.cachePtr);
 
-            assertThrows(IllegalStateException.class, () -> readerR1.decRef());
+            assertThrows(IllegalStateException.class,()-> readerR1.decRef());
         } catch (Exception e) {
             throw new RuntimeException(e);
         } finally {
@@ -355,5 +355,4 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
 
         return shardPath;
     }
-
 }

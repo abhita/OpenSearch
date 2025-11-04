@@ -52,9 +52,6 @@ import static org.opensearch.common.settings.ClusterSettings.BUILT_IN_CLUSTER_SE
 import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_ENABLED;
 import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_EVICTION_TYPE;
 import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_SIZE_LIMIT;
-import static org.opensearch.datafusion.search.cache.CacheSettings.STATS_CACHE_ENABLED;
-import static org.opensearch.datafusion.search.cache.CacheSettings.STATS_CACHE_EVICTION_TYPE;
-import static org.opensearch.datafusion.search.cache.CacheSettings.STATS_CACHE_SIZE_LIMIT;
 
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -83,10 +80,6 @@ public class DataFusionServiceTests extends OpenSearchTestCase {
         clusterSettingsToAdd.add(METADATA_CACHE_ENABLED);
         clusterSettingsToAdd.add(METADATA_CACHE_SIZE_LIMIT);
         clusterSettingsToAdd.add(METADATA_CACHE_EVICTION_TYPE);
-
-        clusterSettingsToAdd.add(STATS_CACHE_ENABLED);
-        clusterSettingsToAdd.add(STATS_CACHE_SIZE_LIMIT);
-        clusterSettingsToAdd.add(STATS_CACHE_EVICTION_TYPE);
 
         ClusterSettings clusterSettings = new ClusterSettings(Settings.EMPTY, clusterSettingsToAdd);
 
@@ -120,9 +113,9 @@ public class DataFusionServiceTests extends OpenSearchTestCase {
 //        // Verify context is gone
 //        assertNull(service.getContext(defaultContext.getContext()));
 //    }
-//
-//     TO run update proper directory path for generation-1-optimized.parquet file in
-//     this.datafusionReaderManager = new DatafusionReaderManager("TODO://FigureOutPath", formatCatalogSnapshot);
+
+    // TO run update proper directory path for generation-1-optimized.parquet file in
+    // this.datafusionReaderManager = new DatafusionReaderManager("TODO://FigureOutPath", formatCatalogSnapshot);
 //    public void testQueryPhaseExecutor() throws IOException {
 //        Map<String, Object[]> finalRes = new HashMap<>();
 //        DatafusionSearcher datafusionSearcher = null;
@@ -179,4 +172,49 @@ public class DataFusionServiceTests extends OpenSearchTestCase {
 //            }
 //        }
 //    }
+
+    public void testCacheOperations() {
+        CacheAccessor metadataCache = service.getCacheManager().getCacheAccessor(CacheType.METADATA);
+
+        CacheManager cacheManager= service.getCacheManager();
+        String fileName = "/Users/abhital/dev/src/forkedrepo/OpenSearch/plugins/engine-datafusion/src/hits9_v1.parquet";
+        // add File using CacheManager
+        cacheManager.addToCache(List.of(fileName));
+
+        // Get file using individual Cache Accessor Methods -> Prints Cache content size
+        assertTrue((Boolean) metadataCache.get(fileName));
+
+        logger.info("Memory Consumed by MetadataCache : {}",metadataCache.getMemoryConsumed());
+        logger.info("Memory Consumed by CacheManager : {}",cacheManager.getTotalUsedBytes());
+
+        logger.info("Total Configured Size Limit for MetadataCache : {}",metadataCache.getConfiguredSizeLimit());
+        logger.info("Total Configured Size Limit for CacheManager : {}",cacheManager.getTotalSizeLimit());
+
+        boolean removed = cacheManager.removeFiles(List.of(fileName));
+        logger.info("Is file removed: {}. Contains File Check: {} ",removed, metadataCache.containsFile(fileName));
+        logger.info("Memory Consumed by MetadataCache after removing entries: {}",metadataCache.getMemoryConsumed());
+        logger.info("Memory Consumed by CacheManager after removing entries: {}",cacheManager.getTotalUsedBytes());
+
+
+        // add File again to cache
+        cacheManager.addToCache(List.of(fileName));
+        logger.info("Entries in Metadata Cache : {}",cacheManager.getCacheAccessor(CacheType.METADATA).getEntries());
+
+        // change cluster setting to update sizeLimit -> eventually evicts entries
+        metadataCache.setSizeLimit(new ByteSizeValue(40));
+        // file will be evicted as sizeLimit is decreased
+        logger.info("Entries in Metadata Cache after sizeLimit exceeds: {}",cacheManager.getCacheAccessor(CacheType.METADATA).getEntries());
+
+        // Add file again to test if cache clear works
+        metadataCache.put(fileName);
+        logger.info("Entries in Metadata Cache after put action with same sizeLimit: {}",cacheManager.getCacheAccessor(CacheType.METADATA).getEntries());
+
+        metadataCache.setSizeLimit(new ByteSizeValue(500000));
+        metadataCache.put(fileName);
+        logger.info("Entries in Metadata Cache after put action with updatedSizeLimit: {}",cacheManager.getCacheAccessor(CacheType.METADATA).getEntries());
+
+        metadataCache.clear();
+        logger.info("Entries in Metadata Cache after Cache Clear: {}",cacheManager.getCacheAccessor(CacheType.METADATA).getEntries());
+
+    }
 }

@@ -819,15 +819,20 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statist
 
     let object_meta = create_object_meta_from_file(&file_path);
 
+    let len_before = cache.len();
     let result = cache.put_with_extra(&path_obj, statistics, &object_meta);
+    let len_after = cache.len();
 
-    if result.is_none() {
-        println!("Failed to cache statistics for: {}", file_path);
-        return false;
+    if len_after > len_before {
+        println!("Successfully cached new stats for: {} (cache: {} -> {})", file_path, len_before, len_after);
+        true
+    } else if result.is_some() {
+        println!("Successfully updated existing stats for: {} (cache: {})", file_path, len_after);
+        true
+    } else {
+        println!("Failed to cache stats for: {} (cache: {})", file_path, len_after);
+        false
     }
-
-    println!("Cached statistics for: {}", file_path);
-    true
 }
 
 #[no_mangle]
