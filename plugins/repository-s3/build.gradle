@@ -113,12 +113,6 @@ dependencies {
   testImplementation project(':test:fixtures:s3-fixture')
 }
 
-restResources {
-  restApi {
-    includeCore '_common', 'cluster', 'nodes', 'snapshot','indices', 'index', 'bulk', 'count'
-  }
-}
-
 tasks.named("dependencyLicenses").configure {
   mapping from: /jackson-.*/, to: 'jackson'
   mapping from: /jaxb-.*/, to: 'jaxb'

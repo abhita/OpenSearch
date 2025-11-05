@@ -28,6 +28,7 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.datafusion.search.DatafusionQuery;
 import org.opensearch.datafusion.search.DatafusionReader;
 import org.opensearch.datafusion.search.DatafusionReaderManager;
 import org.opensearch.datafusion.search.DatafusionSearcher;
@@ -39,14 +40,14 @@ import org.opensearch.index.shard.ShardPath;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.vectorized.execution.search.DataFormat;
 
-import static org.apache.lucene.tests.util.LuceneTestCase.createTempDir;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThrows;
 import static org.mockito.Mockito.when;
 import static org.opensearch.common.settings.ClusterSettings.BUILT_IN_CLUSTER_SETTINGS;
 import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_ENABLED;
 import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_EVICTION_TYPE;
 import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_SIZE_LIMIT;
+import static org.opensearch.datafusion.search.cache.CacheSettings.STATS_CACHE_ENABLED;
+import static org.opensearch.datafusion.search.cache.CacheSettings.STATS_CACHE_EVICTION_TYPE;
+import static org.opensearch.datafusion.search.cache.CacheSettings.STATS_CACHE_SIZE_LIMIT;
 import static org.opensearch.index.engine.Engine.SearcherScope.INTERNAL;
 
 public class DataFusionReaderManagerTests extends OpenSearchTestCase {
@@ -66,6 +67,9 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
         clusterSettingsToAdd.add(METADATA_CACHE_ENABLED);
         clusterSettingsToAdd.add(METADATA_CACHE_SIZE_LIMIT);
         clusterSettingsToAdd.add(METADATA_CACHE_EVICTION_TYPE);
+        clusterSettingsToAdd.add(STATS_CACHE_ENABLED);
+        clusterSettingsToAdd.add(STATS_CACHE_SIZE_LIMIT);
+        clusterSettingsToAdd.add(STATS_CACHE_EVICTION_TYPE);
 
         ClusterSettings clusterSettings = new ClusterSettings(Settings.EMPTY, clusterSettingsToAdd);
 
@@ -160,6 +164,55 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
 
         // Add new file and refresh
        // addResourceFilesToShardPath(shardPath, "hits1.parquet");
+        addFilesToShardPath(shardPath,"hits1.parquet");
+        RefreshResult refreshResult2 = new RefreshResult();
+        WriterFileSet writerFileSet2 = new WriterFileSet(shardPath.getDataPath(), 2);
+        writerFileSet2.add(shardPath.getDataPath() + "/hits3.parquet");
+        writerFileSet2.add(shardPath.getDataPath() + "/hits1.parquet");
+        refreshResult2.add(getMockDataFormat(), List.of(writerFileSet2));
+        readerManager.afterRefresh(true, new CatalogSnapshot(refreshResult2, 2));
+
+        DatafusionSearcher searcher2 = engine.acquireSearcher("test2");
+        DatafusionReader reader2 = searcher2.getReader();
+
+        // Should have different readers
+        assertNotSame(reader1, reader2);
+        assertEquals(1, reader1.files.stream().toList().getFirst().getFiles().size());
+        assertEquals(2, reader2.files.stream().toList().getFirst().getFiles().size());
+
+        searcher1.close();
+        searcher2.close();
+    }
+
+    public void testSearch() throws IOException {
+        ShardPath shardPath = createShardPathWithResourceFiles("test-index", 0, "hits3.parquet");
+        DatafusionEngine engine = new DatafusionEngine(DataFormat.PARQUET, Collections.emptyList(), service, shardPath);
+        DatafusionReaderManager readerManager = engine.getReferenceManager(INTERNAL);
+
+        // Initial refresh
+        RefreshResult refreshResult1 = new RefreshResult();
+        WriterFileSet writerFileSet1 = new WriterFileSet(shardPath.getDataPath(), 1);
+        writerFileSet1.add(shardPath.getDataPath() + "/hits3.parquet");
+        refreshResult1.add(getMockDataFormat(), List.of(writerFileSet1));
+        readerManager.afterRefresh(true, new CatalogSnapshot(refreshResult1, 1));
+
+        DatafusionSearcher searcher1 = engine.acquireSearcher("test-index");
+        DatafusionReader reader1 = searcher1.getReader();
+
+        byte[] protoContent;
+        try (InputStream is = getClass().getResourceAsStream("/substrait_1.pb")) {
+            protoContent = is.readAllBytes();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+
+        DatafusionQuery datafusionQuery = new DatafusionQuery("test-index", protoContent, new java.util.ArrayList<>());
+
+        Long res = searcher1.search(datafusionQuery,service.getRuntimePointer(),service.getTokioRuntimePointer());
+
+        logger.info(res);
+        // Add new file and refresh
+        // addResourceFilesToShardPath(shardPath, "hits1.parquet");
         addFilesToShardPath(shardPath,"hits1.parquet");
         RefreshResult refreshResult2 = new RefreshResult();
         WriterFileSet writerFileSet2 = new WriterFileSet(shardPath.getDataPath(), 2);
