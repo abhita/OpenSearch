@@ -4,10 +4,11 @@ import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
 
 import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_ENABLED;
+import static org.opensearch.datafusion.search.cache.CacheSettings.STATS_CACHE_ENABLED;
 
 public enum CacheType {
-    METADATA(MetadataCacheAccessor::new, METADATA_CACHE_ENABLED);
-   // STATS(StatsCacheAccessor::new);
+    METADATA(MetadataCacheAccessor::new, METADATA_CACHE_ENABLED),
+    STATISTICS(StatisticsCacheAccessor::new, STATS_CACHE_ENABLED);
 
     private final CacheFactory factory;
     private final Setting<Boolean> enabledSetting;

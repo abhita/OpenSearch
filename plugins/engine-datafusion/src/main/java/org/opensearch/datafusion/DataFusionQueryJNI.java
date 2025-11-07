@@ -222,4 +222,95 @@ public class DataFusionQueryJNI {
      * @param cachePtr the cache pointer
      */
     public static native void metadataCacheClear(long cachePtr);
+
+    // STATISTICS cache specific methods
+
+    /**
+     * Create statistics cache
+     * @param cacheConfigPtr cache configuration pointer
+     * @param sizeLimit sizeLimit for cache
+     * @return cache pointer
+     */
+    public static native long createStatisticsCache(long cacheConfigPtr, long sizeLimit);
+
+    /**
+     * Put statistics entry into cache
+     * @param cachePtr the cache pointer
+     * @param filePath the file path
+     * @return status code
+     */
+    public static native boolean statisticsCachePut(long cachePtr, String filePath);
+
+    /**
+     * Get statistics from cache
+     * @param cachePtr the cache pointer
+     * @param filePath the file path
+     * @return cached statistics or null if not found
+     */
+    public static native boolean statisticsCacheGet(long cachePtr, String filePath);
+
+    /**
+     * Remove statistics from cache
+     * @param cachePtr the cache pointer
+     * @param filePath the file path
+     * @return status code
+     */
+    public static native boolean statisticsCacheRemove(long cachePtr, String filePath);
+
+    /**
+     * Memory consumed by statisticsCache
+     * @param cachePtr the cache pointer
+     * @return memory used
+     */
+    public static native long statisticsCacheGetSize(long cachePtr);
+
+    /**
+     * Update size limit for statisticsCache
+     * @param cachePtr the cache pointer
+     * @param newSizeLimit new size limit
+     * @return boolean
+     */
+    public static native boolean statisticsCacheUpdateSizeLimit(long cachePtr, long newSizeLimit);
+
+    /**
+     * Check if a file exists in statisticsCache
+     * @param cachePtr the cache pointer
+     * @param filePath the file path
+     * @return boolean
+     */
+    public static native boolean statisticsCacheContainsFile(long cachePtr, String filePath);
+
+    /**
+     * Get all entries from the statistics cache
+     * @param cachePtr the cache pointer
+     * @return String array containing cache entries in triplets: [path1, size1, hitCount1, path2, size2, hitCount2, ...]
+     *         Each entry consists of 3 consecutive elements: file path, size in bytes, and hit count
+     */
+    public static native String[] statisticsCacheGetEntries(long cachePtr);
+
+    /**
+     * Clear all entries in statisticsCache
+     * @param cachePtr the cache pointer
+     */
+    public static native void statisticsCacheClear(long cachePtr);
+
+    /**
+     * Get hit count from statistics cache
+     */
+    public static native long statisticsCacheGetHitCount(long cachePtr);
+
+    /**
+     * Get miss count from statistics cache
+     */
+    public static native long statisticsCacheGetMissCount(long cachePtr);
+
+    /**
+     * Get hit rate from statistics cache (returns value between 0.0 and 1.0)
+     */
+    public static native double statisticsCacheGetHitRate(long cachePtr);
+
+    /**
+     * Reset hit and miss counters in statistics cache
+     */
+    public static native void statisticsCacheResetStats(long cachePtr);
 }

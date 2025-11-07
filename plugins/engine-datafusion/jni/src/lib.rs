@@ -20,9 +20,20 @@ use std::time::Instant;
 mod util;
 mod row_id_optimizer;
 mod listing_table;
-mod cache;
+mod metadata_cache;
+mod statistics_cache;
+mod cache_policy;
 
 use datafusion::execution::context::SessionContext;
+use datafusion::physical_plan::Statistics;
+use datafusion::common::stats::Precision;
+
+use crate::cache_policy::{CacheConfig, PolicyType};
+use crate::statistics_cache::CustomStatisticsCache;
+use crate::util::{
+    construct_file_metadata, create_object_meta_from_file, create_object_meta_from_filenames,
+    parse_string_arr, set_object_result_error, set_object_result_ok,
+};
 use datafusion::prelude::SessionConfig;
 use datafusion::DATAFUSION_VERSION;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -36,17 +47,17 @@ use prost::Message;
 use tokio::runtime::Runtime;
 use crate::listing_table::{ListingOptions, ListingTable, ListingTableConfig};
 use crate::row_id_optimizer::FilterRowIdOptimizer;
-use crate::cache::{MutexFileMetadataCache};
-use crate::util::{construct_file_metadata, create_object_meta_from_file, create_object_meta_from_filenames, parse_string_arr, set_object_result_error, set_object_result_ok};
-
+use crate::metadata_cache::{MutexFileMetadataCache};
 use datafusion::datasource::file_format::csv::CsvFormat;
-use datafusion::datasource::listing::{ListingTableUrl};
 use datafusion::execution::cache::cache_manager::{self, CacheManagerConfig, FileMetadataCache};
+use datafusion::execution::cache::cache_unit::{
+    DefaultFileStatisticsCache, DefaultFilesMetadataCache, DefaultListFilesCache,
+};
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::physical_plan::FileMeta;
-use datafusion::execution::cache::cache_unit::{DefaultFilesMetadataCache, DefaultListFilesCache};
 use datafusion::execution::cache::CacheAccessor;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion_datasource::ListingTableUrl;
 
 
 /// Create a new DataFusion session context
@@ -364,8 +375,6 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_nativeC
     session_context_ptr
 }
 
-
-
 #[no_mangle]
 pub extern "system" fn Java_org_opensearch_datafusion_RecordBatchStream_next(
     mut env: JNIEnv,
@@ -669,4 +678,548 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_metadat
 ) {
     let cache = unsafe { &*(cache_ptr as *const Arc<MutexFileMetadataCache>) };
     cache.inner.lock().unwrap().clear();
+}
+
+// STATISTICS CACHE METHODS
+
+/// Create a statistics cache and add it to the CacheManagerConfig
+/// The config_ptr remains the same, only the contents are updated
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createStatisticsCache(
+    _env: JNIEnv,
+    _class: JClass,
+    config_ptr: jlong,
+    size_limit: jlong,
+) -> jlong {
+    // Create memory-aware policy cache with default LRU policy
+    let config = CacheConfig {
+        policy_type: PolicyType::Lru,
+        size_limit: size_limit as usize,
+        eviction_threshold: 0.8,
+    };
+    let memory_aware_cache = CustomStatisticsCache::new(config);
+
+    // Create a new DefaultFileStatisticsCache for the CacheManagerConfig
+    let stats_cache = Arc::new(DefaultFileStatisticsCache::default());
+
+    // Update the CacheManagerConfig at the same memory location
+    if config_ptr != 0 {
+        let cache_manager_config = unsafe { &mut *(config_ptr as *mut CacheManagerConfig) };
+        *cache_manager_config = cache_manager_config
+            .clone()
+            .with_files_statistics_cache(Some(stats_cache));
+    }
+
+    // Return the CustomStatisticsCache pointer for JNI operations
+    Box::into_raw(Box::new(memory_aware_cache)) as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCachePut(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+    file_path: JString,
+) -> bool {
+    let file_path: String = match env.get_string(&file_path) {
+        Ok(s) => s.into(),
+        Err(_) => return false,
+    };
+
+    let cache =  unsafe { &mut *(cache_ptr as *mut CustomStatisticsCache) };
+    let data_format = if file_path.to_lowercase().ends_with(".parquet") {
+        "parquet"
+    } else {
+        return false; // Skip unsupported formats
+    };
+
+    // Use DataFusion's parquet statistics construction
+    let statistics = Runtime::new()
+        .expect("Failed to create Tokio Runtime")
+        .block_on(async {
+            use datafusion::common::stats::ColumnStatistics;
+            use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+            use parquet::file::reader::{FileReader, SerializedFileReader};
+            use std::fs::File;
+
+            match File::open(&file_path) {
+                Ok(file) => {
+                    match SerializedFileReader::new(file) {
+                        Ok(reader) => {
+                            let metadata = reader.metadata();
+
+                            // Extract row count from all row groups
+                            let mut num_rows = 0;
+                            let mut total_byte_size = 0;
+                            for rg in metadata.row_groups() {
+                                num_rows += rg.num_rows();
+                                total_byte_size += rg.total_byte_size();
+                            }
+
+                            // Build column statistics from parquet metadata
+                            let mut column_stats = Vec::new();
+                            let num_columns = metadata.file_metadata().schema_descr().num_columns();
+
+                            for col_idx in 0..num_columns {
+                                let mut col_null_count = 0;
+                                let mut col_distinct_count = None;
+                                let mut has_min_max = false;
+
+                                // Aggregate statistics across all row groups for this column
+                                for rg in metadata.row_groups() {
+                                    if let Some(col_chunk) = rg.columns().get(col_idx) {
+                                        if let Some(stats) = col_chunk.statistics() {
+                                            if let Some(null_count) = stats.null_count_opt() {
+                                                col_null_count += null_count;
+                                            }
+                                            if let Some(distinct) = stats.distinct_count() {
+                                                col_distinct_count = Some(distinct);
+                                            }
+                                            has_min_max = stats.has_min_max_set();
+                                        }
+                                    }
+                                }
+
+                                // Create column statistics
+                                column_stats.push(ColumnStatistics {
+                                    null_count: Precision::Exact(col_null_count as usize),
+                                    max_value: Precision::Absent,
+                                    min_value: Precision::Absent,
+                                    distinct_count: col_distinct_count
+                                        .map(|count| Precision::Exact(count as usize))
+                                        .unwrap_or(Precision::Absent),
+                                    sum_value: Precision::Absent,
+                                });
+                            }
+
+                            Arc::new(Statistics {
+                                num_rows: Precision::Exact(num_rows as usize),
+                                total_byte_size: Precision::Exact(total_byte_size as usize),
+                                column_statistics: column_stats,
+                            })
+                        }
+                        Err(_) => Arc::new(Statistics::new_unknown(&arrow_schema::Schema::empty())),
+                    }
+                }
+                Err(_) => Arc::new(Statistics::new_unknown(&arrow_schema::Schema::empty())),
+            }
+        });
+
+    let path_obj = match object_store::path::Path::from_url_path(&file_path) {
+        Ok(path) => path,
+        Err(_) => {
+            println!("Failed to create path object from: {}", file_path);
+            return false;
+        }
+    };
+
+    let object_meta = create_object_meta_from_file(&file_path);
+
+    let len_before = cache.len();
+    let result = cache.put_with_extra(&path_obj, statistics, &object_meta);
+    let len_after = cache.len();
+
+    if len_after > len_before {
+        println!("Successfully cached new stats for: {} (cache: {} -> {})", file_path, len_before, len_after);
+        true
+    } else if result.is_some() {
+        println!("Successfully updated existing stats for: {} (cache: {})", file_path, len_after);
+        true
+    } else {
+        println!("Failed to cache stats for: {} (cache: {})", file_path, len_after);
+        false
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheRemove(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+    file_path: JString,
+) -> bool {
+    let file_path: String = match env.get_string(&file_path) {
+        Ok(s) => s.into(),
+        Err(_) => return false,
+    };
+
+    let path_obj = match object_store::path::Path::from_url_path(&file_path) {
+        Ok(path) => path,
+        Err(_) => {
+            println!("Failed to create path object from: {}", file_path);
+            return false;
+        }
+    };
+
+    let cache = unsafe { &mut *(cache_ptr as *mut CustomStatisticsCache) };
+
+    if let Some(_cache_obj) = cache.remove(&path_obj){
+        println!("Cache removed for: {}", file_path);
+        true
+    } else {
+        println!("Item not found in cache: {}", file_path);
+        false
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheGet(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+    file_path: JString,
+) -> bool {
+    let file_path: String = match env.get_string(&file_path) {
+        Ok(s) => s.into(),
+        Err(_) => return false,
+    };
+
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
+    let path_obj = match object_store::path::Path::from_url_path(&file_path) {
+        Ok(path) => path,
+        Err(_) => {
+            println!("Failed to create path object from: {}", file_path);
+            return false;
+        }
+    };
+
+    match cache.get(&path_obj) {
+        Some(statistics) => {
+            println!("Retrieved statistics for: {}", file_path);
+            true
+        }
+        None => {
+            println!("No statistics found for: {}", file_path);
+            false
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheGetEntries(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+) -> jni::sys::jobjectArray {
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
+
+    // Get all entries from the DashMap
+    let entries: Vec<_> = cache.inner().iter().collect();
+
+    println!("Retrieved {} statistics cache entries", entries.len());
+
+    // Create String array class
+    let string_class = match env.find_class("java/lang/String") {
+        Ok(cls) => cls,
+        Err(e) => {
+            println!("Failed to find String class: {:?}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create array with just the paths
+    let array_size = entries.len() as i32;
+    let result_array = match env.new_object_array(array_size, &string_class, JObject::null()) {
+        Ok(arr) => arr,
+        Err(e) => {
+            println!("Failed to create object array: {:?}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Fill the array with entry paths
+    for (index, entry) in entries.iter().enumerate() {
+        let path_str = entry.key().to_string();
+        if let Ok(jstr) = env.new_string(path_str) {
+            let _ = env.set_object_array_element(&result_array, index as i32, jstr);
+        }
+    }
+
+    result_array.as_raw()
+}
+
+/// Get current memory usage from statistics cache
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheGetSize(
+    _env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+) -> jlong {
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
+
+    // Return actual memory consumed by the cache entries
+    cache.memory_consumed() as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheContainsFile(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+    file_path: JString
+) -> bool {
+    let file_path: String = match env.get_string(&file_path) {
+        Ok(s) => s.into(),
+        Err(_) => return false,
+    };
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
+
+    let path_obj = match object_store::path::Path::from_url_path(&file_path) {
+        Ok(path) => path,
+        Err(_) => {
+            println!("Failed to create path object from: {}", file_path);
+            return false;
+        }
+    };
+    cache.inner().contains_key(&path_obj)
+}
+
+/// Update size limit for statistics cache
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheUpdateSizeLimit(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+    new_size_limit: jlong,
+) -> bool {
+    let cache = unsafe { &mut *(cache_ptr as *mut CustomStatisticsCache) };
+
+    // Update size limit using the policy cache's functionality
+    match cache.update_size_limit(new_size_limit as usize) {
+        Ok(_) => {
+            println!("Statistics cache size limit updated to: {}", new_size_limit);
+        }
+        Err(_) => {
+            println!("Failed to update statistics cache size limit to: {}", new_size_limit);
+        }
+    }
+
+    true
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheClear(
+    env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+) {
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
+    cache.clear();
+    println!("Statistics cache cleared");
+}
+
+/// Get hit count from statistics cache
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheGetHitCount(
+    _env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+) -> jlong {
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
+    cache.hit_count() as jlong
+}
+
+/// Get miss count from statistics cache
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheGetMissCount(
+    _env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+) -> jlong {
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
+    cache.miss_count() as jlong
+}
+
+/// Get hit rate from statistics cache (returns value between 0.0 and 1.0)
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheGetHitRate(
+    _env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+) -> f64 {
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
+    cache.hit_rate()
+}
+
+/// Reset hit and miss counters in statistics cache
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_statisticsCacheResetStats(
+    _env: JNIEnv,
+    _class: JClass,
+    cache_ptr: jlong,
+) {
+    let cache = unsafe { &*(cache_ptr as *const CustomStatisticsCache) };
+    cache.reset_stats();
+    println!("Statistics cache hit/miss counters reset");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn test_concurrent_file_statistics_cache_operations() {
+        // Create a statistics cache
+        let stats_cache = Arc::new(DefaultFileStatisticsCache::default());
+
+        // Create some test paths
+        let test_paths: Vec<object_store::path::Path> = (0..10)
+            .map(|i| object_store::path::Path::from(format!("/test/file{}.parquet", i)))
+            .collect();
+
+        // Pre-populate cache with some statistics
+        for (i, path) in test_paths.iter().enumerate() {
+            let stats = Arc::new(Statistics {
+                num_rows: Precision::Exact(i * 100),
+                total_byte_size: Precision::Exact(i * 1000),
+                column_statistics: vec![],
+            });
+            // DefaultFileStatisticsCache requires put_with_extra
+            let meta = ObjectMeta {
+                location: path.clone(),
+                last_modified: chrono::Utc::now(),
+                size: (i * 1000) as u64,
+                e_tag: None,
+                version: None,
+            };
+            stats_cache.put_with_extra(path, stats, &meta);
+        }
+
+        println!("Initial cache size: {}", stats_cache.len());
+
+        // Spawn multiple reader threads
+        let mut reader_handles = vec![];
+        for thread_id in 0..5 {
+            let cache_clone = stats_cache.clone();
+            let paths_clone = test_paths.clone();
+
+            let handle = thread::spawn(move || {
+                for _ in 0..20 {
+                    for path in &paths_clone {
+                        if let Some(stats) = cache_clone.get(path) {
+                            // Verify we can read the statistics
+                            assert!(stats.num_rows != Precision::Absent);
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                println!("Reader thread {} completed", thread_id);
+            });
+
+            reader_handles.push(handle);
+        }
+
+        // Spawn multiple writer threads that add new entries
+        let mut writer_handles = vec![];
+        for thread_id in 0..3 {
+            let cache_clone = stats_cache.clone();
+
+            let handle = thread::spawn(move || {
+                for i in 0..10 {
+                    let path = object_store::path::Path::from(
+                        format!("/test/writer{}_file{}.parquet", thread_id, i)
+                    );
+                    let stats = Arc::new(Statistics {
+                        num_rows: Precision::Exact(thread_id * 1000 + i),
+                        total_byte_size: Precision::Exact(thread_id * 10000 + i * 100),
+                        column_statistics: vec![],
+                    });
+                    let meta = ObjectMeta {
+                        location: path.clone(),
+                        last_modified: chrono::Utc::now(),
+                        size: (thread_id * 10000 + i * 100) as u64,
+                        e_tag: None,
+                        version: None,
+                    };
+                    cache_clone.put_with_extra(&path, stats, &meta);
+                    thread::sleep(Duration::from_millis(2));
+                }
+                println!("Writer thread {} completed", thread_id);
+            });
+
+            writer_handles.push(handle);
+        }
+
+        // Wait for all threads to complete
+        for handle in reader_handles {
+            handle.join().expect("Reader thread panicked");
+        }
+
+        for handle in writer_handles {
+            handle.join().expect("Writer thread panicked");
+        }
+
+        println!("Final cache size: {}", stats_cache.len());
+
+        // Verify cache contains expected entries
+        assert!(stats_cache.len() >= 10, "Cache should contain at least the initial 10 entries");
+
+        // Verify we can still read from cache
+        for path in &test_paths {
+            assert!(stats_cache.contains_key(path), "Original paths should still be in cache");
+        }
+
+        println!("✓ Concurrent operations test passed!");
+    }
+
+    #[test]
+    fn test_arc_get_mut_behavior() {
+        // Test the Arc::get_mut behavior used in statisticsCacheRemove
+        let path = object_store::path::Path::from("/test/single.parquet");
+
+        // Create a single Arc reference
+        let mut cache_arc = Arc::new(DefaultFileStatisticsCache::default());
+        let meta = ObjectMeta {
+            location: path.clone(),
+            last_modified: chrono::Utc::now(),
+            size: 2000,
+            e_tag: None,
+            version: None,
+        };
+        cache_arc.put_with_extra(&path, Arc::new(Statistics {
+            num_rows: Precision::Exact(200),
+            total_byte_size: Precision::Exact(2000),
+            column_statistics: vec![],
+        }), &meta);
+
+        assert!(cache_arc.contains_key(&path), "Path should be in cache");
+
+        // With single reference, Arc::get_mut should succeed
+        if let Some(cache_mut) = Arc::get_mut(&mut cache_arc) {
+            let _ = cache_mut.remove(&path);
+            println!("✓ Successfully removed with single Arc reference");
+        } else {
+            panic!("Arc::get_mut failed with single reference");
+        }
+
+        assert!(!cache_arc.contains_key(&path), "Path should be removed");
+
+        // Test with multiple references
+        let mut cache_arc2 = Arc::new(DefaultFileStatisticsCache::default());
+        let meta2 = ObjectMeta {
+            location: path.clone(),
+            last_modified: chrono::Utc::now(),
+            size: 3000,
+            e_tag: None,
+            version: None,
+        };
+        cache_arc2.put_with_extra(&path, Arc::new(Statistics {
+            num_rows: Precision::Exact(300),
+            total_byte_size: Precision::Exact(3000),
+            column_statistics: vec![],
+        }), &meta2);
+
+        let _clone = cache_arc2.clone(); // Create second reference
+
+        // With multiple references, Arc::get_mut should fail
+        if Arc::get_mut(&mut cache_arc2).is_some() {
+            panic!("Arc::get_mut should fail with multiple references");
+        } else {
+            println!("✓ Arc::get_mut correctly failed with multiple references");
+        }
+
+        println!("✓ Arc::get_mut behavior test passed!");
+    }
 }
