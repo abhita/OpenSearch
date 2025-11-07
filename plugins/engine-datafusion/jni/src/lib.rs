@@ -48,27 +48,6 @@ use datafusion::execution::cache::cache_unit::{DefaultFilesMetadataCache, Defaul
 use datafusion::execution::cache::CacheAccessor;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 
-// Exception handling macro for JNI
-macro_rules! jni_try {
-    ($env:expr, $result:expr) => {
-        match $result {
-            Ok(val) => val,
-            Err(e) => {
-                let _ = $env.throw_new("java/lang/RuntimeException", &e.to_string());
-                return -1;
-            }
-        }
-    };
-    ($env:expr, $result:expr, $default:expr) => {
-        match $result {
-            Ok(val) => val,
-            Err(e) => {
-                let _ = $env.throw_new("java/lang/RuntimeException", &e.to_string());
-                return $default;
-            }
-        }
-    };
-}
 
 /// Create a new DataFusion session context
 #[no_mangle]
@@ -129,9 +108,9 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createG
 ) -> jlong {
     let cache_manager_config = unsafe { Box::from_raw(cache_config_ptr as *mut CacheManagerConfig) };
 
-    let runtime_env = jni_try!(env, RuntimeEnvBuilder::default()
+    let runtime_env = RuntimeEnvBuilder::default()
         .with_cache_manager(*cache_manager_config)
-        .build());
+        .build();
 
     Box::into_raw(Box::new(runtime_env)) as jlong
 }
@@ -177,7 +156,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createD
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_destroyReader(
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_closeDatafusionReader(
     mut env: JNIEnv,
     _class: JClass,
     ptr: jlong

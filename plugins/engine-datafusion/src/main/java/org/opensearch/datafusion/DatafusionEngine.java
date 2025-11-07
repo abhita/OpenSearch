@@ -115,7 +115,6 @@ public class DatafusionEngine extends SearchExecEngine<DatafusionContext, Datafu
                 @Override
                 protected void doClose() {
                     try {
-                        cacheManager.removeFilesByDirectory(reader.directoryPath);
                         datafusionReaderManager.release(reader);
                     } catch (IOException e) {
                         throw new UncheckedIOException(e);

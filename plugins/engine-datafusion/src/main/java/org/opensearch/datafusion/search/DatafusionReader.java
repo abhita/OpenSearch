@@ -70,23 +70,7 @@ public class DatafusionReader implements Closeable {
      * Increments the reference count.
      */
     public void incRef() {
-        if (!tryIncRef()) {
-            throw new IllegalStateException("DatafusionReader is already closed");
-        }
-    }
-    
-    /**
-     * Tries to increment the reference count.
-     * @return true if successful, false if already closed
-     */
-    public boolean tryIncRef() {
-        int count;
-        while ((count = refCount.get()) > 0) {
-            if (refCount.compareAndSet(count, count + 1)) {
-                return true;
-            }
-        }
-        return false;
+        refCount.getAndIncrement();
     }
 
     /**
@@ -108,7 +92,7 @@ public class DatafusionReader implements Closeable {
             throw new IllegalStateException("Listing table has been already closed");
         }
 
-//        closeDatafusionReader(this.cachePtr);
+        closeDatafusionReader(this.cachePtr);
         this.cachePtr = -1;
     }
 }
