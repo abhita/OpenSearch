@@ -53,11 +53,8 @@ use datafusion::execution::cache::cache_manager::{self, CacheManagerConfig, File
 use datafusion::execution::cache::cache_unit::{
     DefaultFileStatisticsCache, DefaultFilesMetadataCache, DefaultListFilesCache,
 };
-use datafusion::datasource::listing::{ListingTableUrl};
-use datafusion::execution::cache::cache_manager::{self, CacheManagerConfig, FileMetadataCache};
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::physical_plan::FileMeta;
-use datafusion::execution::cache::cache_unit::{DefaultFilesMetadataCache, DefaultListFilesCache};
 use datafusion::execution::cache::CacheAccessor;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion_datasource::ListingTableUrl;
@@ -212,6 +209,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_execute
     tokio_runtime_env_ptr: jlong,
     // callback: JObject,
 ) -> jlong {
+    let overall = Instant::now();
     let shard_view = unsafe { &*(shard_view_ptr as *const ShardView) };
     let runtime_ptr = unsafe { &*(tokio_runtime_env_ptr as *const Runtime)};
     let table_name: String = env.get_string(&table_name).expect("Couldn't get java string!").into();
