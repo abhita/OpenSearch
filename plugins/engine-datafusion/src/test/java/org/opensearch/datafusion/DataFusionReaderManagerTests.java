@@ -14,10 +14,12 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.junit.After;
 import org.junit.Before;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.Index;
@@ -31,6 +33,10 @@ import org.opensearch.search.aggregations.SearchResultsCollector;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.vectorized.execution.search.DataFormat;
 
+import static org.opensearch.common.settings.ClusterSettings.BUILT_IN_CLUSTER_SETTINGS;
+import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_ENABLED;
+import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_EVICTION_TYPE;
+import static org.opensearch.datafusion.search.cache.CacheSettings.METADATA_CACHE_SIZE_LIMIT;
 import static org.opensearch.index.engine.Engine.SearcherScope.INTERNAL;
 
 public class DataFusionReaderManagerTests extends OpenSearchTestCase {
@@ -42,10 +48,20 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
     @Before
     public void setup() {
         MockitoAnnotations.openMocks(this);
-        service = new DataFusionService(Collections.emptyMap());
+        Set<Setting<?>> clusterSettingsToAdd = new HashSet<>(BUILT_IN_CLUSTER_SETTINGS);
+        clusterSettingsToAdd.add(METADATA_CACHE_ENABLED);
+        clusterSettingsToAdd.add(METADATA_CACHE_SIZE_LIMIT);
+        clusterSettingsToAdd.add(METADATA_CACHE_EVICTION_TYPE);
+
+        ClusterSettings clusterSettings = new ClusterSettings(Settings.EMPTY, clusterSettingsToAdd);
+        service = new DataFusionService(Collections.emptyMap(),clusterSettings);
         service.doStart();
     }
 
+    @After
+    public void cleanUp(){
+        service.doStop();
+    }
     // ========== Test Cases ==========
 
     /** Test that a reader is created with correct file count and cache pointer after initial refresh */
@@ -104,6 +120,7 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
         reader.decRef();
         assertEquals(0,getRefCount(reader));
         assertEquals(-1, reader.getCachePtr());
+
     }
 
     /** Test that reader stays alive when only some searchers are closed (reference counting) */
@@ -132,6 +149,7 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
         searcher2.close();
         assertEquals(1,getRefCount(reader));
         assertNotEquals(-1, reader.cachePtr);
+
     }
 
     /** Test that refresh creates a new reader with updated file list */
@@ -177,6 +195,7 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
         assertEquals(0, getRefCount(reader1));
         searcher2.close();
         assertEquals(1, getRefCount(reader2));
+
     }
 
     /** Test that calling decRef on an already closed reader throws IllegalStateException */
@@ -200,6 +219,7 @@ public class DataFusionReaderManagerTests extends OpenSearchTestCase {
 
         // Calling decRef on closed reader should throw
         assertThrows(IllegalStateException.class, reader::decRef);
+
     }
 
 // R1 -> f1,f2,f3

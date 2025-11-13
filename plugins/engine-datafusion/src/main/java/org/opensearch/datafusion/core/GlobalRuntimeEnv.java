@@ -8,7 +8,15 @@
 
 package org.opensearch.datafusion.core;
 
+import java.io.IOException;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.datafusion.search.cache.CacheManager;
+import org.opensearch.datafusion.search.cache.CacheUtils;
+
 import static org.opensearch.datafusion.DataFusionQueryJNI.closeGlobalRuntime;
+import static org.opensearch.datafusion.DataFusionQueryJNI.createDefaultGlobalRuntimeEnv;
 import static org.opensearch.datafusion.DataFusionQueryJNI.createGlobalRuntime;
 import static org.opensearch.datafusion.DataFusionQueryJNI.createTokioRuntime;
 
@@ -18,14 +26,31 @@ import static org.opensearch.datafusion.DataFusionQueryJNI.createTokioRuntime;
  */
 public class GlobalRuntimeEnv implements AutoCloseable {
     // ptr to runtime environment in df
-    private final long ptr;
-    private final long tokio_runtime_ptr;
+    private long ptr;
+    private long tokio_runtime_ptr;
+    private CacheManager cacheManager;
+    private static final Logger logger = LogManager.getLogger(GlobalRuntimeEnv.class);
 
-    /**
-     * Creates a new global runtime environment.
-     */
-    public GlobalRuntimeEnv() {
-        this.ptr = createGlobalRuntime();
+
+    public GlobalRuntimeEnv(ClusterSettings clusterSettings) {
+
+        try {
+            // Create cache configuration
+            long cacheConfigPtr = CacheUtils.createCacheConfig(clusterSettings);
+            // Create global runtime with cache config
+            this.ptr = createGlobalRuntime(cacheConfigPtr);
+            this.cacheManager = new CacheManager();
+            this.tokio_runtime_ptr = createTokioRuntime();
+        } catch (Exception e) {
+            logger.error("Failed to create global runtime environment. Using DefaultGlobalRuntimeEnv", e);
+            useDefaultRuntime();
+
+        }
+    }
+
+    private void useDefaultRuntime() {
+        this.ptr = createDefaultGlobalRuntimeEnv();
+        this.cacheManager = null;
         this.tokio_runtime_ptr = createTokioRuntime();
     }
 
@@ -42,7 +67,20 @@ public class GlobalRuntimeEnv implements AutoCloseable {
     }
 
     @Override
-    public void close() {
+    public void close() throws IOException {
+        if (cacheManager != null) {
+            cacheManager.close();
+        }
+        if (this.ptr == -1) {
+            logger.info("Global runtime environment already closed");
+            return;
+        }
         closeGlobalRuntime(this.ptr);
+        this.ptr = -1;
+
+    }
+
+    public CacheManager getCacheManager() {
+        return cacheManager;
     }
 }

@@ -53,7 +53,7 @@ use datafusion::execution::{
 use datafusion_expr::{
     dml::InsertOp, Expr, SortExpr, TableProviderFilterPushDown, TableType,
 };
-use datafusion::physical_expr::schema_rewriter::PhysicalExprAdapterFactory;
+use datafusion::physical_expr_adapter::schema_rewriter::PhysicalExprAdapterFactory;
 use datafusion::physical_expr_common::sort_expr::LexOrdering;
 use datafusion::physical_plan::{empty::EmptyExec, ExecutionPlan, Statistics};
 use futures::{future, stream, Stream, StreamExt, TryStreamExt};
@@ -64,7 +64,7 @@ use std::fs::File;
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures::future::err;
 use regex::Regex;
-use crate::FileMetadata;
+use crate::FileMeta;
 
 /// Indicates the source of the schema for a [`ListingTable`]
 // PartialEq required for assert_eq! in tests
@@ -490,7 +490,7 @@ pub struct ListingOptions {
     ///       single element.
     pub file_sort_order: Vec<Vec<SortExpr>>,
 
-    pub files_metadata: Arc<Vec<FileMetadata>>
+    pub files_metadata: Arc<Vec<FileMeta>>
 }
 
 impl ListingOptions {
@@ -543,7 +543,7 @@ impl ListingOptions {
         self
     }
 
-    pub fn with_files_metadata(mut self, files_metadata: Arc<Vec<FileMetadata>>) -> Self {
+    pub fn with_files_metadata(mut self, files_metadata: Arc<Vec<FileMeta>>) -> Self {
         self.files_metadata = files_metadata.clone();
         self
     }
@@ -1128,6 +1128,8 @@ impl ListingTable {
         let mut cumulative_row_base = 0;
         let mut file_row_bases: HashMap<String, i32> = HashMap::new();
 
+        println!("Options: {:?}",self.options.files_metadata);
+
         // Process files in order to calculate cumulative row bases
         for group in &file_groups {
             for file in group.files() {
@@ -1223,6 +1225,10 @@ impl TableProvider for ListingTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+
+
+        println!("1:");
+
         // extract types of partition columns
         let table_partition_cols = self
             .options
@@ -1249,6 +1255,8 @@ impl TableProvider for ListingTable {
         let (mut partitioned_file_lists, statistics) = self
             .list_files_for_scan(state, &vec![], statistic_file_limit)
             .await?;
+
+        
         //
         // let (mut partitioned_file_lists, statistics) = self
         //     .list_files_for_scan(state, &partition_filters, statistic_file_limit)
@@ -1256,9 +1264,12 @@ impl TableProvider for ListingTable {
 
         // if no files need to be read, return an `EmptyExec`
         if partitioned_file_lists.is_empty() {
+             println!("2: partitioned_file_lists: {:?}",partitioned_file_lists.clone());
             let projected_schema = project_schema(&self.schema(), projection)?;
             return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
+
+         println!("3: partitioned_file_lists: {:?}",partitioned_file_lists.clone());
 
         partitioned_file_lists = self.add_path_preserving_metadata(partitioned_file_lists).expect("Unable to update Metadata for partitioned files");
 

@@ -27,11 +27,15 @@ import java.util.Objects;
 public class DatafusionSearcher implements EngineSearcher<DatafusionQuery, RecordBatchStream> {
     private final String source;
     private DatafusionReader reader;
+    private Long tokioRuntimePtr;
+    private Long globalRuntimeEnvId;
     private Closeable closeable;
 
-    public DatafusionSearcher(String source, DatafusionReader reader, Closeable close) {
+    public DatafusionSearcher(String source, DatafusionReader reader, Long tokioRuntimePtr, Long globalRuntimeEnvId, Closeable close) {
         this.source = source;
         this.reader = reader;
+        this.tokioRuntimePtr = tokioRuntimePtr;
+        this.globalRuntimeEnvId = globalRuntimeEnvId;
         this.closeable = close;
     }
 
@@ -44,7 +48,7 @@ public class DatafusionSearcher implements EngineSearcher<DatafusionQuery, Recor
     public void search(DatafusionQuery datafusionQuery, List<SearchResultsCollector<RecordBatchStream>> collectors) throws IOException {
         // TODO : call search here to native
         // TODO : change RunTimePtr
-        long nativeStreamPtr = DataFusionQueryJNI.executeQueryPhase(reader.getCachePtr(), datafusionQuery.toString(), datafusionQuery.getSubstraitBytes(), 0);
+        long nativeStreamPtr = DataFusionQueryJNI.executeQueryPhase(reader.getCachePtr(), datafusionQuery.toString(), datafusionQuery.getSubstraitBytes(), tokioRuntimePtr, globalRuntimeEnvId);
         RecordBatchStream stream = new DefaultRecordBatchStream(nativeStreamPtr);
         while(stream.hasNext()) {
             for(SearchResultsCollector<RecordBatchStream> collector : collectors) {
@@ -62,9 +66,9 @@ public class DatafusionSearcher implements EngineSearcher<DatafusionQuery, Recor
                 .toArray();
             String[] projections = Objects.isNull(datafusionQuery.getProjections()) ? new String[]{} : datafusionQuery.getProjections().toArray(String[]::new);
 
-            return DataFusionQueryJNI.executeFetchPhase(reader.getCachePtr(), row_ids, projections, contextPtr);
+            return DataFusionQueryJNI.executeFetchPhase(reader.getCachePtr(), row_ids, projections, contextPtr, globalRuntimeEnvId);
         }
-        return DataFusionQueryJNI.executeQueryPhase(reader.getCachePtr(), datafusionQuery.getIndexName(), datafusionQuery.getSubstraitBytes(), contextPtr);
+        return DataFusionQueryJNI.executeQueryPhase(reader.getCachePtr(), datafusionQuery.getIndexName(), datafusionQuery.getSubstraitBytes(), contextPtr, globalRuntimeEnvId);
     }
 
     public DatafusionReader getReader() {

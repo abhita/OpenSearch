@@ -77,8 +77,18 @@ public class DataFusionQueryJNI {
      * Create a new global runtime environment
      * @return runtime env pointer for subsequent operations
      */
-    public static native long createGlobalRuntime();
+    public static native long createGlobalRuntime(long cacheManagerPtr);
 
+    /**
+     * Create a default global runtime environment with default configuration
+     * @return runtime environment pointer
+     */
+    public static native long createDefaultGlobalRuntimeEnv();
+
+    /**
+     * Create a new Tokio async runtime for executing async operations
+     * @return tokio runtime pointer
+     */
     public static native long createTokioRuntime();
 
     /**
@@ -110,23 +120,37 @@ public class DataFusionQueryJNI {
     /**
      * Execute a Substrait query plan
      * @param cachePtr the session context ID
+     * @param tableName the name of the table to query
      * @param substraitPlan the serialized Substrait query plan
+     * @param tokioRuntimePtr pointer to the Tokio runtime
+     * @param runtimeEnvPtr pointer to the runtime environment
      * @return stream pointer for result iteration
      */
-    public static native long executeQueryPhase(long cachePtr, String tableName, byte[] substraitPlan, long runtimePtr);
+    public static native long executeQueryPhase(long cachePtr, String tableName, byte[] substraitPlan, long tokioRuntimePtr, long runtimeEnvPtr);
 
     /**
-     * Execute a Substrait query plan
+     * Execute a fetch phase to retrieve specific rows by their IDs
      * @param cachePtr the session context ID
-     * @param rowIds row ids for which record needs to fetch
-     * @param runtimePtr runtime pointer
+     * @param rowIds array of row IDs to fetch
+     * @param projections array of column names to project
+     * @param tokioRuntimePtr pointer to the Tokio runtime
+     * @param runtimeEnvPtr pointer to the runtime environment
      * @return stream pointer for result iteration
      */
+    public static native long executeFetchPhase(long cachePtr, long[] rowIds, String[] projections, long tokioRuntimePtr, long runtimeEnvPtr);
 
-    public static native long executeFetchPhase(long cachePtr, long[] rowIds, String[] projections, long runtimePtr);
-
+    /**
+     * Create a DataFusion reader for reading parquet files
+     * @param path the base path for the files
+     * @param files array of file names to read
+     * @return reader pointer
+     */
     public static native long createDatafusionReader(String path, String[] files);
 
+    /**
+     * Close and cleanup a DataFusion reader
+     * @param ptr the reader pointer to close
+     */
     public static native void closeDatafusionReader(long ptr);
 
     /**
@@ -158,4 +182,95 @@ public class DataFusionQueryJNI {
      * @param streamPtr the stream pointer to close
      */
     public static native void closeStream(long streamPtr);
+
+
+    /**
+     * Initialize cache manager config (creates empty config)
+     * @return cache manager config pointer
+     */
+    public static native long initCacheManagerConfig();
+
+    // Cache creation methods
+
+    /**
+     * Generic cache creation method that handles all cache types
+     * @param cacheManagerConfigPointer cache manager config pointer
+     * @param cacheType cache type name (e.g., "METADATA", "STATS")
+     * @param sizeLimit size limit for cache in bytes
+     * @param evictionType eviction policy (e.g., "LRU", "LFU", "FIFO")
+     * @return cache pointer
+     */
+    public static native long createCache(long cacheManagerConfigPointer, String cacheType, long sizeLimit, String evictionType);
+
+    /**
+     * Create a new empty CustomCacheManager
+     * @return custom cache manager pointer
+     */
+    public static native long createCustomCacheManager();
+
+    /**
+     * Destroy CustomCacheManager and free associated resources
+     * @throws DataFusionException if destruction fails
+     */
+    public static native void destroyCustomCacheManager();
+
+    /**
+     * Add multiple files to the cache manager for caching metadata
+     * @param filePaths array of file paths to add to the cache
+     * @throws DataFusionException if adding files fails
+     */
+    public static native void cacheManagerAddFiles(String[] filePaths);
+
+    /**
+     * Remove multiple files from the cache manager
+     * @param filePaths array of file paths to remove from the cache
+     * @throws DataFusionException if removing files fails
+     */
+    public static native void cacheManagerRemoveFiles(String[] filePaths);
+
+    /**
+     * Clear all entries from a specific cache type
+     * @param cacheType the type of cache to clear (e.g., "METADATA", "STATS")
+     * @throws DataFusionException if clearing cache fails
+     */
+    public static native void cacheManagerClearByCacheType(String cacheType);
+
+    /**
+     * Clear all entries from all cache types
+     * @throws DataFusionException if clearing cache fails
+     */
+    public static native void cacheManagerClear();
+
+    /**
+     * Update the size limit for a specific cache type
+     * @param cacheType the type of cache to update (e.g., "METADATA", "STATS")
+     * @param sizeLimit new size limit in bytes
+     * @throws DataFusionException if updating size limit fails
+     */
+    public static native void cacheManagerUpdateSizeLimitForCacheType(String cacheType, long sizeLimit);
+
+    /**
+     * Get the memory consumed by a specific cache type
+     * @param cacheType the type of cache to query (e.g., "METADATA", "STATS")
+     * @return memory consumed in bytes
+     * @throws DataFusionException if querying memory fails
+     */
+    public static native long cacheManagerGetMemoryConsumedForCacheType(String cacheType);
+
+    /**
+     * Check if a specific file exists in a cache type
+     * @param cacheType the type of cache to check (e.g., "METADATA", "STATS")
+     * @param filePath the file path to check
+     * @return true if the file exists in the cache, false otherwise
+     * @throws DataFusionException if checking cache fails
+     */
+    public static native boolean cacheManagerGetItemByCacheType(String cacheType, String filePath);
+
+    /**
+     * Get the total memory consumed by all cache types
+     * @return total memory consumed in bytes across all caches
+     * @throws DataFusionException if querying memory fails
+     */
+    public static native long cacheManagerGetTotalMemoryConsumed();
+
 }

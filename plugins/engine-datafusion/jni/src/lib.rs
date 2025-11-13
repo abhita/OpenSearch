@@ -5,17 +5,24 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-use arrow_array::ffi::FFI_ArrowArray;
-use arrow_array::{Array, StructArray};
-use arrow_schema::ffi::FFI_ArrowSchema;
+use std::ptr::addr_of_mut;
+use datafusion_datasource::PartitionedFile;
+use datafusion_datasource::file_groups::FileGroup;
+use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+use datafusion_datasource::source::DataSourceExec;
+use datafusion_expr::expr_rewriter::unalias;
 use jni::objects::{JByteArray, JClass, JObject};
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::ptr::addr_of_mut;
+use downcast_rs::Downcast;
 use jni::objects::{JLongArray, JValue};
 use jni::sys::{jbyteArray, jlong, jstring};
 use jni::JNIEnv;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use arrow_array::{Array, StructArray};
+use arrow_array::ffi::FFI_ArrowArray;
+use arrow_schema::DataType;
+use arrow_schema::ffi::FFI_ArrowSchema;
 use datafusion::{
     common::DataFusionError,
     prelude::*,
@@ -42,26 +49,33 @@ use std::time::Instant;
 mod util;
 mod row_id_optimizer;
 mod listing_table;
+mod cache;
+mod custom_cache_manager;
 
-use crate::listing_table::{ListingOptions, ListingTable, ListingTableConfig};
-use crate::util::{create_file_metadata_from_filenames, parse_string_arr, set_object_result_error, set_object_result_ok};
-use datafusion_datasource::file_groups::FileGroup;
-use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
-use datafusion_datasource::PartitionedFile;
-use datafusion_substrait::logical_plan::consumer::{from_substrait_plan, from_substrait_plan_with_consumer, DefaultSubstraitConsumer, SubstraitConsumer};
-use datafusion_substrait::substrait::proto::{Expression, ExtensionLeafRel, ExtensionMultiRel, ExtensionSingleRel, Plan, PlanRel, ProjectRel};
+
+use crate::row_id_optimizer::ProjectRowIdOptimizer;
+use crate::util::{ create_file_meta_from_filenames, parse_string_arr, set_object_result_error, set_object_result_ok};
+use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
+use datafusion_substrait::substrait::proto::Plan;
 use futures::TryStreamExt;
 use jni::objects::{JObjectArray, JString};
 use object_store::ObjectMeta;
 use prost::Message;
 use tokio::runtime::Runtime;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::fs::OpenOptions;
 use std::io::Write;
-use arrow_schema::DataType;
-use datafusion::catalog::TableProvider;
-use datafusion_datasource::source::DataSourceExec;
-use datafusion_expr::registry::FunctionRegistry;
-use datafusion_substrait::extensions::Extensions;
-use crate::row_id_optimizer::ProjectRowIdOptimizer;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::listing_table::{ListingOptions, ListingTable, ListingTableConfig};
+use crate::cache::{ MutexFileMetadataCache};
+use crate::util::{construct_file_metadata, create_object_meta_from_file};
+
+ use datafusion::execution::cache::cache_manager::{self, CacheManager, FileMetadataCache};
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
+use datafusion::execution::cache::cache_unit::{DefaultFilesMetadataCache};
+
 
 /// Create a new DataFusion session context
 #[no_mangle]
@@ -116,30 +130,32 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createT
 
 #[no_mangle]
 pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createGlobalRuntime(
-    _env: JNIEnv,
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_config_ptr: jlong,
+) -> jlong {
+    // Get the Arc<Mutex<CacheManagerConfig>> and clone the inner config
+    let config_arc = unsafe { &*(cache_config_ptr as *const Arc<Mutex<CacheManagerConfig>>) };
+    let cache_manager_config = config_arc.lock().unwrap().clone();
+
+    let runtime_env = RuntimeEnvBuilder::default()
+        .with_cache_manager(cache_manager_config)
+        .build()
+        .unwrap();
+
+    Box::into_raw(Box::new(runtime_env)) as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createDefaultGlobalRuntimeEnv(
+    mut env: JNIEnv,
     _class: JClass,
 ) -> jlong {
-    let runtime_env = RuntimeEnvBuilder::default().build().unwrap();
-    /**
-    // We can copy global runtime to local runtime - file statistics cache, and most of the things
-    // will be shared across session contexts. But list files cache will be specific to session
-    // context
+    let runtime_env = RuntimeEnvBuilder::default()
+        .build()
+        .unwrap();
 
-    let fsCache = runtimeEnv.clone().cache_manager.get_file_statistic_cache().unwrap();
-    let localCacheManagerConfig = CacheManagerConfig::default().with_files_statistics_cache(Option::from(fsCache));
-    let localCacheManager = CacheManager::try_new(&localCacheManagerConfig);
-    let localRuntimeEnv = RuntimeEnvBuilder::new()
-        .with_cache_manager(localCacheManagerConfig)
-        .with_disk_manager(DiskManagerConfig::new_existing(runtimeEnv.disk_manager))
-        .with_memory_pool(runtimeEnv.memory_pool)
-        .with_object_store_registry(runtimeEnv.object_store_registry)
-        .build();
-    let config = SessionConfig::new().with_repartition_aggregations(true);
-    let context = SessionContext::new_with_config(config);
-    **/
-
-    let ctx = Box::into_raw(Box::new(runtime_env)) as jlong;
-    ctx
+    Box::into_raw(Box::new(runtime_env)) as jlong
 }
 
 #[no_mangle]
@@ -164,7 +180,6 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_closeSe
     let _ = unsafe { Box::from_raw(context_id as *mut SessionContext) };
 }
 
-
 #[no_mangle]
 pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createDatafusionReader(
     mut env: JNIEnv,
@@ -188,7 +203,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createD
         }
     };
 
-    let files_metadata = match create_file_metadata_from_filenames(&table_path, files.clone()) {
+    let files_metadata = match create_file_meta_from_filenames(&table_path, files.clone()) {
         Ok(metadata) => metadata,
         Err(err) => {
             let _ = env.throw_new("java/lang/RuntimeException", format!("Failed to create metadata: {}", err));
@@ -218,13 +233,43 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_closeDa
     let _ = unsafe { Box::from_raw(ptr as *mut ShardView) };
 }
 
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_closeGlobalRuntime(
+    mut env: JNIEnv,
+    _class: JClass,
+    runtime_env_ptr: jlong
+)  {
+    let _ = unsafe { Box::from_raw(runtime_env_ptr as *mut RuntimeEnv) };
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_destroyTokioRuntime(
+    mut env: JNIEnv,
+    _class: JClass,
+    tokio_runtime_ptr: jlong
+)  {
+    let _ = unsafe { Box::from_raw(tokio_runtime_ptr as *mut Runtime) };
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_destroyMetadataCache(
+    mut env: JNIEnv,
+    _class: JClass,
+    metadata_cache_ptr: jlong
+)  {
+    // The pointer is actually Arc<MutexFileMetadataCache>, not DefaultFilesMetadataCache
+    if metadata_cache_ptr != 0 && metadata_cache_ptr != -1 {
+        let _ = unsafe { Box::from_raw(metadata_cache_ptr as *mut Arc<MutexFileMetadataCache>) };
+    }
+}
+
 pub struct ShardView {
     table_path: ListingTableUrl,
-    files_metadata: Arc<Vec<FileMetadata>>
+    files_metadata: Arc<Vec<FileMeta>>
 }
 
 impl ShardView {
-    pub fn new(table_path: ListingTableUrl, files_metadata: Vec<FileMetadata>) -> Self {
+    pub fn new(table_path: ListingTableUrl, files_metadata: Vec<FileMeta>) -> Self {
         let files_metadata = Arc::new(files_metadata);
         ShardView {
             table_path,
@@ -236,24 +281,24 @@ impl ShardView {
         self.table_path.clone()
     }
 
-    pub fn files_metadata(&self) -> Arc<Vec<FileMetadata>> {
+    pub fn files_metadata(&self) -> Arc<Vec<FileMeta>> {
         self.files_metadata.clone()
     }
 }
 
 #[derive(Debug, Clone)]
-struct FileMetadata {
+struct FileMeta {
     row_group_row_counts: Arc<Vec<i64>>,
     row_base: Arc<i64>,
     object_meta: Arc<ObjectMeta>,
 }
 
-impl FileMetadata {
+impl FileMeta {
     pub fn new(row_group_row_counts: Vec<i64>, row_base: i64, object_meta: ObjectMeta) -> Self {
         let row_group_row_counts = Arc::new(row_group_row_counts);
         let row_base = Arc::new(row_base);
         let object_meta = Arc::new(object_meta);
-        FileMetadata {
+        FileMeta {
             row_group_row_counts,
             row_base,
             object_meta
@@ -281,30 +326,29 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_execute
     table_name: JString,
     substrait_bytes: jbyteArray,
     tokio_runtime_env_ptr: jlong,
+    global_runtime_env_ptr: jlong,
     // callback: JObject,
 ) -> jlong {
     let overall = Instant::now();
     let shard_view = unsafe { &*(shard_view_ptr as *const ShardView) };
     let runtime_ptr = unsafe { &*(tokio_runtime_env_ptr as *const Runtime)};
+    let runtime_env = unsafe { &*(global_runtime_env_ptr as *const RuntimeEnv)};
     let table_name: String = env.get_string(&table_name).expect("Couldn't get java string!").into();
 
+
     let table_path = shard_view.table_path();
-    let files_metadata = shard_view.files_metadata();
-    let object_meta: Arc<Vec<ObjectMeta>> = Arc::new(files_metadata
-        .iter()
-        .map(|metadata| (*metadata.object_meta).clone())
-        .collect());
+    let files_meta = shard_view.files_metadata();
 
     println!("Table path: {}", table_path);
-    println!("Files: {:?}", object_meta);
+    println!("Files: {:?}", files_meta);
 
-    let list_file_cache = Arc::new(DefaultListFilesCache::default());
-    list_file_cache.put(table_path.prefix(), object_meta);
+    // let list_file_cache = Arc::new(DefaultListFilesCache::default());
+    // list_file_cache.put(table_path.prefix(), files_meta);
 
-    let runtime_env = RuntimeEnvBuilder::new()
-        .with_cache_manager(CacheManagerConfig::default()
-            .with_list_files_cache(Some(list_file_cache.clone()))
-        ).build().unwrap();
+    // let runtime_env = RuntimeEnvBuilder::new()
+    //     .with_cache_manager(CacheManagerConfig::default()
+    //                             .with_list_files_cache(Some(list_file_cache.clone()))
+    //     ).build().unwrap();
 
     // TODO: get config from CSV DataFormat
     let mut config = SessionConfig::new();
@@ -313,7 +357,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_execute
 
     let state = datafusion::execution::SessionStateBuilder::new()
         .with_config(config)
-        .with_runtime_env(Arc::from(runtime_env))
+        .with_runtime_env(Arc::new(runtime_env.clone()))
         .with_default_features()
         .with_physical_optimizer_rule(Arc::new(ProjectRowIdOptimizer))
         .build();
@@ -324,7 +368,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_execute
     let file_format = ParquetFormat::new();
     let listing_options = ListingOptions::new(Arc::new(file_format))
         .with_file_extension(".parquet") // TODO: take this as parameter
-        .with_files_metadata(files_metadata)
+        .with_files_metadata(files_meta)
         .with_table_partition_cols(vec![("row_base".to_string(), DataType::Int64)]);
 
     // Ideally the executor will give this
@@ -551,10 +595,13 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_execute
     values: JLongArray,
     projections: JObjectArray,
     tokio_runtime_env_ptr: jlong,
+    global_runtime_env_ptr: jlong,
     callback: JObject,
 ) -> jlong{
     let shard_view = unsafe { &*(shard_view_ptr as *const ShardView) };
     let runtime_ptr = unsafe { &*(tokio_runtime_env_ptr as *const Runtime)};
+    let runtime_env = unsafe { &*(global_runtime_env_ptr as *const RuntimeEnv)};
+
 
     let table_path = shard_view.table_path();
     let files_metadata = shard_view.files_metadata();
@@ -607,14 +654,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_execute
         .map(|metadata| (*metadata.object_meta).clone())
         .collect());
 
-    let list_file_cache = Arc::new(DefaultListFilesCache::default());
-    list_file_cache.put(table_path.prefix(), object_meta);
-
-    let runtime_env = RuntimeEnvBuilder::new()
-        .with_cache_manager(CacheManagerConfig::default()
-            .with_list_files_cache(Some(list_file_cache))
-        ).build().unwrap();
-    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), Arc::new(runtime_env));
+    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), Arc::new(runtime_env.clone()));
 
     // Create default parquet options
     let file_format = ParquetFormat::new();
@@ -623,6 +663,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_execute
     // .with_table_partition_cols(vec![("row_base".to_string(), DataType::Int32)]); // TODO: enable only for query phase
 
     // Ideally the executor will give this
+
 
 
     runtime_ptr.block_on(async {
@@ -720,7 +761,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_execute
 
 async fn create_access_plans(
     row_ids: Vec<jlong>,
-    files_metadata: Arc<Vec<FileMetadata>>,
+    files_metadata: Arc<Vec<FileMeta>>,
 ) -> Result<Vec<ParquetAccessPlan>, DataFusionError> {
     let mut access_plans = Vec::new();
 
@@ -837,10 +878,332 @@ pub extern "system" fn Java_org_opensearch_datafusion_RecordBatchStream_closeStr
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_closeGlobalRuntime(
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_initCacheManagerConfig(
     _env: JNIEnv,
     _class: JClass,
-    runtime: jlong
+) -> jlong {
+    // Wrap in Arc<Mutex<>> for reference counting and safe mutation
+    let config = Arc::new(Mutex::new(CacheManagerConfig::default()));
+    Box::into_raw(Box::new(config)) as jlong
+}
+
+
+/// Generic cache creation method that handles all cache types
+/// This is the new unified approach for creating caches
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_createCache(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_manager_config_ptr: jlong,
+    cache_type: JString,
+    size_limit: jlong,
+    eviction_type: JString,
+) -> jlong {
+    // Convert Java strings to Rust strings
+    let cache_type_str: String = match env.get_string(&cache_type) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            let msg = format!("Failed to convert cache_type string: {}", e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("java/lang/DataFusionException", &msg);
+            return 0;
+        }
+    };
+
+    let eviction_type_str: String = match env.get_string(&eviction_type) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            let msg = format!("Failed to convert eviction_type string: {}", e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("java/lang/DataFusionException", &msg);
+            return 0;
+        }
+    };
+
+    println!("[CACHE INFO] Creating cache: type={}, size_limit={}, eviction_type={}",
+             cache_type_str, size_limit, eviction_type_str);
+
+    // Call the Rust cache creation function with both pointers
+    match cache::create_cache(
+        cache_manager_config_ptr,
+        &cache_type_str,
+        size_limit as usize,
+        &eviction_type_str
+    ) {
+        Ok(_) => {
+            println!("[CACHE INFO] Successfully created {} cache", cache_type_str);
+        }
+        Err(e) => {
+            eprintln!("[CACHE ERROR] Failed to create cache: {}", e);
+            let _ = env.throw_new("java/lang/DataFusionException", &e);
+        }
+    }
+
+    // Return success indicator (0 for now, can be enhanced later)
+    0
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_cacheManagerAddFiles(
+    mut env: JNIEnv,
+    _class: JClass,
+    files: JObjectArray,
 ) {
-    let _ = unsafe { Box::from_raw(runtime as *mut RuntimeEnv) };
+    // Parse the array of file paths
+    let file_paths: Vec<String> = match parse_string_arr(&mut env, files) {
+        Ok(paths) => paths,
+        Err(e) => {
+            let msg = format!("Failed to parse file paths array: {}", e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("org/opensearch/datafusion/DataFusionException", &msg);
+            return;
+        }
+    };
+
+    // Track success/failure for each file
+    let mut all_successful = true;
+    let mut failed_files = Vec::new();
+
+    // Loop over each file path and add to cache
+    for file_path in file_paths {
+        match custom_cache_manager::add_files_to_cache(&file_path) {
+            Ok(_) => {
+                println!("[CACHE INFO] Successfully added file to cache: {}", file_path);
+            }
+            Err(e) => {
+                eprintln!("[CACHE ERROR] Failed to add file '{}' to cache: {}", file_path, e);
+                failed_files.push(file_path);
+                all_successful = false;
+            }
+        }
+    }
+
+    // If any files failed, log exception with details
+    if !all_successful {
+        let msg = format!("Failed to add {} files to cache: {:?}", failed_files.len(), failed_files);
+        eprintln!("[CACHE ERROR] {}", msg);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_cacheManagerRemoveFiles(
+    mut env: JNIEnv,
+    _class: JClass,
+    files: JObjectArray,
+) {
+    // Parse the array of file paths
+    let file_paths: Vec<String> = match parse_string_arr(&mut env, files) {
+        Ok(paths) => paths,
+        Err(e) => {
+            let msg = format!("Failed to parse file paths array: {}", e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("org/opensearch/datafusion/DataFusionException", &msg);
+            return;
+        }
+    };
+
+    // Track success/failure for each file
+    let mut all_successful = true;
+    let mut failed_files = Vec::new();
+
+    // Loop over each file path and remove from cache
+    for file_path in file_paths {
+        match custom_cache_manager::remove_files_from_cache(&file_path) {
+            Ok(_) => {
+                println!("[CACHE INFO] Successfully removed file from cache: {}", file_path);
+            }
+            Err(e) => {
+                eprintln!("[CACHE ERROR] Failed to remove file '{}' from cache: {}", file_path, e);
+                failed_files.push(file_path);
+                all_successful = false;
+            }
+        }
+    }
+
+    // If any files failed, log exception with details
+    if !all_successful {
+        let msg = format!("Failed to remove {} files from cache: {:?}", failed_files.len(), failed_files);
+        eprintln!("[CACHE ERROR] {}", msg);
+    }
+
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_cacheManagerClear(
+    mut env: JNIEnv,
+    _class: JClass,
+) {
+
+    match custom_cache_manager::clear_all() {
+        Ok(_) => {
+            println!("[CACHE INFO] Successfully cleared cache:");
+        }
+        Err(e) => {
+            eprintln!("[CACHE ERROR] Failed to clear cache: {}", e);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_cacheManagerUpdateSizeLimitForCacheType(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_type: JString,
+    new_size_limit: jlong,
+) -> bool {
+    let cache_type: String = match env.get_string(&cache_type) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            let msg = format!("Failed to convert cache type string: {}", e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("org/opensearch/datafusion/DataFusionException", &msg);
+            return false;
+        }
+    };
+
+    match custom_cache_manager::update_cache_limit_by_type(&cache_type, new_size_limit as usize) {
+        Ok(_) => true,
+        Err(e) => {
+            let msg = format!("Failed to update cache size limit for type '{}': {}", cache_type, e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("org/opensearch/datafusion/DataFusionException", &msg);
+            false
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_cacheManagerGetMemoryConsumedForCacheType(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_type: JString
+) -> jlong {
+    let cache_type: String = match env.get_string(&cache_type) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            let msg = format!("Failed to convert cache type string: {}", e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("org/opensearch/datafusion/DataFusionException", &msg);
+            return 0;
+        }
+    };
+
+    match custom_cache_manager::get_memory_consumed_by_type(&cache_type) {
+        Ok(result) => result as jlong,
+        Err(e) => {
+            let msg = format!("Failed to get memory consumed for cache type '{}': {}", cache_type, e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("org/opensearch/datafusion/DataFusionException", &msg);
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_cacheManagerGetItemByCacheType(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_type: JString,
+    file_path: JString,
+) -> bool {
+    let cache_type: String = match env.get_string(&cache_type) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            let msg = format!("Failed to convert cache type string: {}", e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("org/opensearch/datafusion/DataFusionException", &msg);
+            return false;
+        }
+    };
+
+    let file_path: String = match env.get_string(&file_path) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            let msg = format!("Failed to convert file path string: {}", e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("org/opensearch/datafusion/DataFusionException", &msg);
+            return false;
+        }
+    };
+
+    match custom_cache_manager::get_item_by_cache_type(&cache_type, &file_path) {
+        Ok(found) => found,
+        Err(e) => {
+            let msg = format!("Failed to get item from cache type '{}' for file '{}': {}", cache_type, file_path, e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("org/opensearch/datafusion/DataFusionException", &msg);
+            false
+        }
+    }
+}
+
+/// Get total memory consumed by all caches in global cache map
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_cacheManagerGetTotalMemoryConsumed(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jlong {
+    match custom_cache_manager::get_total_memory_consumed() {
+        Ok(total) => {
+            println!("[CACHE INFO] Total memory consumed: {} bytes", total);
+            total as jlong
+        }
+        Err(e) => {
+            let msg = format!("Failed to get total memory consumed: {}", e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("org/opensearch/datafusion/DataFusionException", &msg);
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_cacheManagerClearByCacheType(
+    mut env: JNIEnv,
+    _class: JClass,
+    cache_type: JString
+) {
+    let cache_type: String = match env.get_string(&cache_type) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            let msg = format!("Failed to convert cache type string: {}", e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("org/opensearch/datafusion/DataFusionException", &msg);
+            return;
+        }
+    };
+
+    match custom_cache_manager::clear_cache_by_type(&cache_type) {
+        Ok(_) => {
+            println!("[CACHE INFO] Cache Type: {} cleared", cache_type);
+        }
+        Err(e) => {
+            let msg = format!("Failed to clear cache type '{}': {}", cache_type, e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("org/opensearch/datafusion/DataFusionException", &msg);
+        }
+    }
+}
+
+/// Destroy CustomCacheManager - removes all cache references from the global HashMap
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_DataFusionQueryJNI_destroyCustomCacheManager(
+    mut env: JNIEnv,
+    _class: JClass,
+) {
+    // Clear the global HashMap (removes references only, doesn't clear cache data)
+    match custom_cache_manager::GLOBAL_CACHE_MAP.lock() {
+        Ok(mut cache_map) => {
+            let cache_count = cache_map.len();
+            cache_map.clear();
+
+            println!("[CACHE INFO] Removed {} cache references from global cache map", cache_count);
+            println!("[CACHE INFO] Note: Cache data remains in CacheManagerConfig if still referenced there");
+        }
+        Err(e) => {
+            let msg = format!("Failed to lock global cache map for cleanup: {}", e);
+            eprintln!("[CACHE ERROR] {}", msg);
+            let _ = env.throw_new("org/opensearch/datafusion/DataFusionException", &msg);
+        }
+    }
 }
