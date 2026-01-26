@@ -539,6 +539,325 @@ mod tests {
     use chrono::Utc;
     use datafusion::common::stats::Precision;
 
+    // ============================================================================
+    // MEMORY ACCURACY TESTS - Using mimalloc FFI
+    // ============================================================================
+    
+    // FFI bindings to mimalloc stats functions
+    extern "C" {
+        fn mi_stats_reset();
+        fn mi_process_info(
+            elapsed_msecs: *mut usize,
+            user_msecs: *mut usize,
+            system_msecs: *mut usize,
+            current_rss: *mut usize,
+            peak_rss: *mut usize,
+            current_commit: *mut usize,
+            peak_commit: *mut usize,
+            page_faults: *mut usize,
+        );
+    }
+
+    /// Get current committed memory from mimalloc
+    fn get_mimalloc_committed_memory() -> usize {
+        let mut elapsed_msecs = 0usize;
+        let mut user_msecs = 0usize;
+        let mut system_msecs = 0usize;
+        let mut current_rss = 0usize;
+        let mut peak_rss = 0usize;
+        let mut current_commit = 0usize;
+        let mut peak_commit = 0usize;
+        let mut page_faults = 0usize;
+        
+        unsafe {
+            mi_process_info(
+                &mut elapsed_msecs,
+                &mut user_msecs,
+                &mut system_msecs,
+                &mut current_rss,
+                &mut peak_rss,
+                &mut current_commit,
+                &mut peak_commit,
+                &mut page_faults,
+            );
+        }
+        current_commit
+    }
+
+    /// Reset mimalloc statistics
+    fn reset_mimalloc_stats() {
+        unsafe { mi_stats_reset(); }
+    }
+
+    /// Helper to create Statistics with column statistics containing ScalarValues
+    fn create_statistics_with_columns(num_columns: usize) -> Statistics {
+        let column_statistics: Vec<ColumnStatistics> = (0..num_columns)
+            .map(|i| ColumnStatistics {
+                null_count: Precision::Exact(i * 10),
+                max_value: Precision::Exact(ScalarValue::Int64(Some((i * 100) as i64))),
+                min_value: Precision::Exact(ScalarValue::Int64(Some((i * 10) as i64))),
+                distinct_count: Precision::Absent,
+                sum_value: Precision::Absent,
+            })
+            .collect();
+
+        Statistics {
+            num_rows: Precision::Exact(1000),
+            total_byte_size: Precision::Exact(50000),
+            column_statistics,
+        }
+    }
+
+    /// Helper to create Statistics with string ScalarValues (heap-allocated)
+    fn create_statistics_with_strings(num_columns: usize, string_len: usize) -> Statistics {
+        let column_statistics: Vec<ColumnStatistics> = (0..num_columns)
+            .map(|i| {
+                let s = "x".repeat(string_len);
+                ColumnStatistics {
+                    null_count: Precision::Exact(i * 10),
+                    max_value: Precision::Exact(ScalarValue::Utf8(Some(s.clone()))),
+                    min_value: Precision::Exact(ScalarValue::Utf8(Some(s))),
+                    distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
+                }
+            })
+            .collect();
+
+        Statistics {
+            num_rows: Precision::Exact(1000),
+            total_byte_size: Precision::Exact(50000),
+            column_statistics,
+        }
+    }
+
+    #[test]
+    fn test_memory_size_reports_nonzero_for_statistics() {
+        let stats = create_statistics_with_columns(5);
+        let reported = stats.memory_size();
+        
+        // Should report something reasonable (at least the struct size)
+        assert!(reported >= std::mem::size_of::<Statistics>(), 
+            "memory_size() should be at least size_of::<Statistics>(), got {}", reported);
+        
+        println!("Statistics with 5 columns - reported memory_size: {} bytes", reported);
+    }
+
+    #[test]
+    fn test_heap_size_increases_with_more_columns() {
+        let stats_1col = create_statistics_with_columns(1);
+        let stats_5col = create_statistics_with_columns(5);
+        let stats_10col = create_statistics_with_columns(10);
+
+        let size_1 = stats_1col.heap_size();
+        let size_5 = stats_5col.heap_size();
+        let size_10 = stats_10col.heap_size();
+
+        println!("heap_size with 1 column: {} bytes", size_1);
+        println!("heap_size with 5 columns: {} bytes", size_5);
+        println!("heap_size with 10 columns: {} bytes", size_10);
+
+        assert!(size_5 > size_1, "5 columns should have larger heap_size than 1 column");
+        assert!(size_10 > size_5, "10 columns should have larger heap_size than 5 columns");
+    }
+
+    #[test]
+    fn test_heap_size_increases_with_string_length() {
+        let stats_short = create_statistics_with_strings(2, 10);
+        let stats_medium = create_statistics_with_strings(2, 100);
+        let stats_long = create_statistics_with_strings(2, 1000);
+
+        let size_short = stats_short.heap_size();
+        let size_medium = stats_medium.heap_size();
+        let size_long = stats_long.heap_size();
+
+        println!("heap_size with 10-char strings: {} bytes", size_short);
+        println!("heap_size with 100-char strings: {} bytes", size_medium);
+        println!("heap_size with 1000-char strings: {} bytes", size_long);
+
+        assert!(size_medium > size_short, "100-char strings should have larger heap_size than 10-char");
+        assert!(size_long > size_medium, "1000-char strings should have larger heap_size than 100-char");
+        
+        // The difference should be roughly proportional to string length difference
+        // 1000-char vs 100-char = ~10x more string data per column (2 columns * 2 strings each = 4 strings)
+        // Expected difference: ~4 * (1000 - 100) = ~3600 bytes
+        let expected_diff_approx = 4 * (1000 - 100);
+        let actual_diff = size_long - size_medium;
+        assert!(actual_diff >= expected_diff_approx / 2, 
+            "String heap difference should be roughly proportional. Expected ~{}, got {}", 
+            expected_diff_approx, actual_diff);
+    }
+
+    #[test]
+    fn test_memory_size_vs_actual_allocation_simple() {
+        // This test creates multiple Statistics objects and compares
+        // the sum of reported memory_size() against actual mimalloc allocation change.
+        
+        // Force any pending deallocations
+        std::hint::black_box(vec![0u8; 1024]);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        
+        let before = get_mimalloc_committed_memory();
+        
+        // Create many objects to get a measurable signal above noise
+        let count = 100;
+        let stats_vec: Vec<Statistics> = (0..count)
+            .map(|_| create_statistics_with_columns(10))
+            .collect();
+        
+        // Prevent compiler from optimizing away
+        std::hint::black_box(&stats_vec);
+        
+        let after = get_mimalloc_committed_memory();
+        let actual_delta = after.saturating_sub(before);
+        
+        let reported_total: usize = stats_vec.iter().map(|s| s.memory_size()).sum();
+        
+        println!("=== Memory Accuracy Test (Simple Statistics) ===");
+        println!("Created {} Statistics objects with 10 columns each", count);
+        println!("Reported total memory_size(): {} bytes", reported_total);
+        println!("Actual mimalloc delta: {} bytes", actual_delta);
+        println!("Ratio (reported/actual): {:.2}", 
+            if actual_delta > 0 { reported_total as f64 / actual_delta as f64 } else { 0.0 });
+        
+        // Memory reported should be in a reasonable range of actual
+        // Allow wide tolerance due to allocator overhead, page alignment, etc.
+        if actual_delta > 0 {
+            let ratio = reported_total as f64 / actual_delta as f64;
+            // Reported should be within 0.1x to 10x of actual (very generous bounds)
+            assert!(ratio > 0.1 && ratio < 10.0,
+                "Memory ratio out of reasonable bounds: reported={}, actual={}, ratio={:.2}",
+                reported_total, actual_delta, ratio);
+        }
+    }
+
+    #[test]
+    fn test_memory_size_vs_actual_allocation_with_strings() {
+        // Test with heap-allocated string data
+        
+        std::hint::black_box(vec![0u8; 1024]);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        
+        let before = get_mimalloc_committed_memory();
+        
+        let count = 50;
+        let string_len = 500;
+        let stats_vec: Vec<Statistics> = (0..count)
+            .map(|_| create_statistics_with_strings(5, string_len))
+            .collect();
+        
+        std::hint::black_box(&stats_vec);
+        
+        let after = get_mimalloc_committed_memory();
+        let actual_delta = after.saturating_sub(before);
+        
+        let reported_total: usize = stats_vec.iter().map(|s| s.memory_size()).sum();
+        
+        // Calculate expected heap from strings alone
+        // Each Statistics has 5 columns, each column has 2 strings (min + max)
+        // Total string heap per Statistics: 5 * 2 * string_len = 5000 bytes
+        let expected_string_heap_per_stats = 5 * 2 * string_len;
+        let expected_string_heap_total = count * expected_string_heap_per_stats;
+        
+        println!("=== Memory Accuracy Test (Statistics with Strings) ===");
+        println!("Created {} Statistics objects with 5 columns, {}-byte strings", count, string_len);
+        println!("Reported total memory_size(): {} bytes", reported_total);
+        println!("Actual mimalloc delta: {} bytes", actual_delta);
+        println!("Expected string heap alone: {} bytes", expected_string_heap_total);
+        println!("Ratio (reported/actual): {:.2}", 
+            if actual_delta > 0 { reported_total as f64 / actual_delta as f64 } else { 0.0 });
+        
+        // The reported size should at least cover the string heap
+        assert!(reported_total >= expected_string_heap_total / 2,
+            "Reported memory should at least cover most of string heap. Reported={}, expected_strings={}",
+            reported_total, expected_string_heap_total);
+    }
+
+    #[test]
+    fn test_cache_memory_tracking_accuracy() {
+        // Test that the cache's memory_consumed() tracks correctly
+        let cache = CustomStatisticsCache::with_default_config();
+        
+        assert_eq!(cache.memory_consumed(), 0, "Empty cache should have 0 memory");
+        
+        // Add entries and verify tracking
+        let mut total_reported = 0usize;
+        for i in 0..10 {
+            let path = create_test_path(&format!("accuracy_test_{}", i));
+            let meta = create_test_meta(&path);
+            let stats = Arc::new(create_statistics_with_strings(3, 100));
+            
+            total_reported += stats.memory_size();
+            cache.put_with_extra(&path, stats, &meta);
+        }
+        
+        let cache_reported = cache.memory_consumed();
+        
+        println!("=== Cache Memory Tracking Test ===");
+        println!("Added 10 entries");
+        println!("Sum of individual memory_size(): {} bytes", total_reported);
+        println!("Cache memory_consumed(): {} bytes", cache_reported);
+        
+        // Cache tracking should match sum of individual sizes
+        assert_eq!(cache_reported, total_reported,
+            "Cache memory_consumed() should equal sum of entry memory_size()");
+    }
+
+    #[test]
+    fn test_scalar_value_string_heap_size() {
+        // Directly test ScalarValue heap_size for strings
+        let short_str = ScalarValue::Utf8(Some("hello".to_string()));
+        let long_str = ScalarValue::Utf8(Some("x".repeat(1000)));
+        let null_str: ScalarValue = ScalarValue::Utf8(None);
+        
+        let short_heap = short_str.heap_size();
+        let long_heap = long_str.heap_size();
+        let null_heap = null_str.heap_size();
+        
+        println!("ScalarValue::Utf8 heap_size:");
+        println!("  5-char string: {} bytes", short_heap);
+        println!("  1000-char string: {} bytes", long_heap);
+        println!("  None: {} bytes", null_heap);
+        
+        // String capacity is usually at least the string length
+        assert!(short_heap >= 5, "5-char string should have heap_size >= 5");
+        assert!(long_heap >= 1000, "1000-char string should have heap_size >= 1000");
+        assert_eq!(null_heap, 0, "None string should have 0 heap_size");
+        
+        // Long string should have much larger heap than short
+        assert!(long_heap > short_heap * 10, 
+            "1000-char string should have >10x heap of 5-char string");
+    }
+
+    #[test]
+    fn test_vec_column_statistics_heap_size() {
+        // Test Vec<ColumnStatistics> heap calculation
+        let empty_vec: Vec<ColumnStatistics> = vec![];
+        let small_vec: Vec<ColumnStatistics> = (0..5)
+            .map(|_| ColumnStatistics::new_unknown())
+            .collect();
+        let large_vec: Vec<ColumnStatistics> = (0..50)
+            .map(|_| ColumnStatistics::new_unknown())
+            .collect();
+        
+        let empty_heap = empty_vec.heap_size();
+        let small_heap = small_vec.heap_size();
+        let large_heap = large_vec.heap_size();
+        
+        println!("Vec<ColumnStatistics> heap_size:");
+        println!("  0 elements: {} bytes", empty_heap);
+        println!("  5 elements: {} bytes", small_heap);
+        println!("  50 elements: {} bytes", large_heap);
+        
+        // Larger vec should have larger heap
+        assert!(small_heap > empty_heap, "5-element vec should have larger heap than empty");
+        assert!(large_heap > small_heap, "50-element vec should have larger heap than 5-element");
+        
+        // The heap should include the buffer (capacity * element_size)
+        let expected_small_buffer = small_vec.capacity() * std::mem::size_of::<ColumnStatistics>();
+        assert!(small_heap >= expected_small_buffer,
+            "heap_size should include at least the buffer size");
+    }
+
     fn create_test_statistics() -> Statistics {
         Statistics {
             num_rows: Precision::Exact(1000),
